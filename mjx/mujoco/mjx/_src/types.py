@@ -497,7 +497,11 @@ class Option(PyTreeNode):
   disableactuator: int
   sdf_initpoints: int = _restricted_to('mujoco')
   sdf_iterations: int = _restricted_to('mujoco')
-
+  col_soft_enable: bool = _restricted_to('mjx')
+  softjax_mode: str = _restricted_to('mjx')
+  cfd_enable: bool = _restricted_to('mjx')
+  cfd_solimp: jax.Array = _restricted_to('mjx')
+  scan_loop: bool = _restricted_to('mjx')
 
 class Statistic(PyTreeNode):
   """Model statistics (in qpos0).

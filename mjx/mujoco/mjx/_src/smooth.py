@@ -762,7 +762,7 @@ def tendon(m: Model, d: Data) -> Data:
     dif = pnt1 - pnt0
     length = math.norm(dif)
     vec = jp.where(
-        length < mujoco.mjMINVAL, jp.array([1.0, 0.0, 0.0]), dif / length
+        length < mujoco.mjMINVAL, jp.array([1.0, 0.0, 0.0]), dif / jp.maximum(length, mujoco.mjMINVAL)
     )
 
     jacp1, _ = support.jac(m, d, pnt0, body0)
