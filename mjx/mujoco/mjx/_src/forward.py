@@ -20,6 +20,7 @@ from typing import Optional, Sequence
 import jax
 from jax import numpy as jp
 import mujoco
+import softjax as sj
 from mujoco.mjx._src import collision_driver
 from mujoco.mjx._src import constraint
 from mujoco.mjx._src import derivative
@@ -67,7 +68,7 @@ def named_scope(fn, name: str = ''):
 
 
 @named_scope
-def fwd_position(m: Model, d: Data) -> Data:
+def fwd_position(m: Model, d: Data, soft: bool = False) -> Data:
   """Position-dependent computations."""
   # TODO(robotics-simulation): tendon
   d = smooth.kinematics(m, d)
@@ -78,7 +79,7 @@ def fwd_position(m: Model, d: Data) -> Data:
   d = smooth.tendon_armature(m, d)
   d = smooth.factor_m(m, d)
   d = collision_driver.collision(m, d)
-  d = constraint.make_constraint(m, d)
+  d = constraint.make_constraint(m, d, soft=soft)
   d = smooth.transmission(m, d)
   return d
 
@@ -207,12 +208,12 @@ def fwd_actuation(m: Model, d: Data) -> Data:
 
     force_scaling = jp.where(
         tendon_total_force < m.tendon_actfrcrange[tendon_actfrclimited_id, 0],
-        m.tendon_actfrcrange[tendon_actfrclimited_id, 0] / tendon_total_force,
+        sj.div(m.tendon_actfrcrange[tendon_actfrclimited_id, 0], tendon_total_force),
         1,
     )
     force_scaling = jp.where(
         tendon_total_force > m.tendon_actfrcrange[tendon_actfrclimited_id, 1],
-        m.tendon_actfrcrange[tendon_actfrclimited_id, 1] / tendon_total_force,
+        sj.div(m.tendon_actfrcrange[tendon_actfrclimited_id, 1], tendon_total_force),
         force_scaling,
     )
 
@@ -429,7 +430,7 @@ def implicit(m: Model, d: Data) -> Data:
 
 
 @named_scope
-def forward(m: Model, d: Data) -> Data:
+def _forward(m: Model, d: Data, soft: bool) -> Data:
   """Forward dynamics."""
   if m.impl == Impl.WARP and d.impl == Impl.WARP and mjxw.WARP_INSTALLED:
     from mujoco.mjx.warp import forward as mjxw_forward  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
@@ -438,7 +439,7 @@ def forward(m: Model, d: Data) -> Data:
   if not isinstance(m._impl, ModelJAX) or not isinstance(d._impl, DataJAX):
     raise ValueError('forward requires JAX backend implementation.')
 
-  d = fwd_position(m, d)
+  d = fwd_position(m, d, soft=soft)
   d = sensor.sensor_pos(m, d)
   d = fwd_velocity(m, d)
   d = sensor.sensor_vel(m, d)
@@ -452,6 +453,17 @@ def forward(m: Model, d: Data) -> Data:
   d = named_scope(solver.solve)(m, d)
   d = sensor.sensor_acc(m, d)
 
+  return d
+
+
+@named_scope
+def forward(m: Model, d: Data) -> Data:
+  if m.opt.cfd_enable:
+    d_soft = _forward(m, d, soft=True)
+    d_hard = _forward(m, d, soft=False)
+    d = jax.tree.map(lambda x_hard, x_soft: jax.lax.stop_gradient(x_hard) + x_soft - jax.lax.stop_gradient(x_soft), d_hard, d_soft)
+  else:
+    d = _forward(m, d, soft=False)
   return d
 
 

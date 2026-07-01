@@ -26,6 +26,7 @@ from typing import Tuple
 
 import jax
 from jax import numpy as jp
+import softjax as sj
 from mujoco.mjx._src import math
 # pylint: disable=g-importing-member
 from mujoco.mjx._src.collision_types import Collision
@@ -90,21 +91,21 @@ def _ellipsoid(pos: jax.Array, size: jax.Array) -> jax.Array:
 
 @jax.custom_jvp
 def _cylinder(pos: jax.Array, size: jax.Array) -> jax.Array:
-  a0 = jp.sqrt(pos[0] * pos[0] + pos[1] * pos[1]) - size[0]
+  a0 = sj.sqrt(pos[0] * pos[0] + pos[1] * pos[1]) - size[0]
   a1 = jp.abs(pos[2]) - size[1]
   b0 = jp.maximum(a0, 0)
   b1 = jp.maximum(a1, 0)
-  return jp.minimum(jp.maximum(a0, a1), 0) + jp.sqrt(b0 * b0 + b1 * b1)
+  return jp.minimum(jp.maximum(a0, a1), 0) + sj.sqrt(b0 * b0 + b1 * b1)
 
 
 def _cylinder_grad(x: jax.Array, size: jax.Array) -> jax.Array:
   """Gradient of the cylinder SDF wrt query point and singularities removed."""
-  c = jp.sqrt(x[0] * x[0] + x[1] * x[1])
+  c = sj.sqrt(x[0] * x[0] + x[1] * x[1])
   e = jp.abs(x[2])
   a = jp.array([c - size[0], e - size[1]])
   b = jp.array([jp.maximum(a[0], 0), jp.maximum(a[1], 0)])
   j = jp.argmax(a)
-  bnorm = jp.sqrt(b[0] * b[0] + b[1] * b[1])
+  bnorm = sj.sqrt(b[0] * b[0] + b[1] * b[1])
   bnorm += jp.allclose(bnorm, 0) * 1e-12
   grada = jp.array([
       x[0] / (c + jp.allclose(c, 0) * 1e-12),

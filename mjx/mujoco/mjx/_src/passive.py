@@ -18,6 +18,7 @@ from typing import Tuple
 
 import jax
 from jax import numpy as jp
+import softjax as sj
 from mujoco.mjx._src import math
 from mujoco.mjx._src import scan
 from mujoco.mjx._src import support
@@ -174,8 +175,8 @@ def _inertia_box_fluid_model(
 
   box = jp.repeat(inertia[None, :], 3, axis=0)
   box *= jp.ones((3, 3)) - 2 * jp.eye(3)
-  box = 6.0 * jp.clip(jp.sum(box, axis=-1), min=1e-12)
-  box = jp.sqrt(box / jp.maximum(mass, 1e-12)) * (mass > 0.0)
+  box = 6.0 * jp.clip(jp.sum(box, axis=-1), 1e-12)
+  box = sj.sqrt(box / jp.maximum(mass, 1e-12)) * (mass > 0.0)
 
   # transform to local coordinate frame
   offset = xipos - root_com

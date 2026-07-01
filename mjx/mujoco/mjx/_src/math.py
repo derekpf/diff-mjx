@@ -19,6 +19,7 @@ from typing import Optional, Tuple, Union
 import jax
 from jax import numpy as jp
 import mujoco
+import softjax as sj
 
 
 def safe_div(
@@ -324,9 +325,96 @@ def make_frame(a: jax.Array) -> jax.Array:
   return jp.array([a, b, c])
 
 
+def normalize_with_norm_soft(
+    x: jax.Array,
+    mode: str,
+    axis: Optional[Union[Tuple[int, ...], int]] = None,
+) -> Tuple[jax.Array, jax.Array]:
+  """Soft-differentiable normalize using sj.norm and sj.div."""
+  n = sj.norm(x, axis=axis)
+  x_normed = sj.div(x, n + 1e-6 * (n == 0.0))
+  return x_normed, n
+
+
+def orthogonals_soft(
+    a: jax.Array, mode: str
+) -> Tuple[jax.Array, jax.Array]:
+  """Returns orthogonal vectors `b` and `c`, with soft conditionals."""
+  y, z = jp.array([0, 1, 0]), jp.array([0, 0, 1])
+  cond1 = sj.less(-0.5, a[1], softness=1.0, mode=mode)
+  cond2 = sj.less(a[1], 0.5, softness=1.0, mode=mode)
+  cond12 = sj.logical_and(cond1, cond2)
+  b = sj.where(cond12, y, z)
+  b = b - a * a.dot(b)
+  # normalize b. however if a is a zero vector, zero b as well.
+  b = normalize_with_norm_soft(b, mode=mode)[0] * jp.any(a)
+  return b, jp.cross(a, b)
+
+
+def make_frame_soft(a: jax.Array, mode: str) -> jax.Array:
+  """Makes a right-handed 3D frame given a direction, with soft ops."""
+  a = normalize(a)
+  b, c = orthogonals_soft(a, mode)
+  return jp.array([a, b, c])
+
+
 # Geometry.
 
 
+def closest_segment_point_soft(
+    a: jax.Array, b: jax.Array, pt: jax.Array, mode: str
+) -> jax.Array:
+  """Soft version of closest_segment_point using sj.div and sj.clip."""
+  ab = b - a
+  t = sj.div(jp.dot(pt - a, ab), jp.dot(ab, ab) + 1e-6)
+  return a + sj.clip(t, 0.0, 1.0, softness=0.01, mode=mode) * ab
+
+
+def closest_segment_point_and_dist_soft(
+    a: jax.Array, b: jax.Array, pt: jax.Array, mode: str
+) -> Tuple[jax.Array, jax.Array]:
+  """Soft version of closest_segment_point_and_dist."""
+  closest = closest_segment_point_soft(a, b, pt, mode)
+  dist = (pt - closest).dot(pt - closest)
+  return closest, dist
+
+
+def closest_segment_to_segment_points_soft(
+    a0: jax.Array, a1: jax.Array, b0: jax.Array, b1: jax.Array, mode: str
+) -> Tuple[jax.Array, jax.Array]:
+  """Soft version of closest_segment_to_segment_points."""
+  dir_a, len_a = normalize_with_norm(a1 - a0)
+  dir_b, len_b = normalize_with_norm(b1 - b0)
+
+  half_len_a = len_a * 0.5
+  half_len_b = len_b * 0.5
+  a_mid = a0 + dir_a * half_len_a
+  b_mid = b0 + dir_b * half_len_b
+
+  trans = a_mid - b_mid
+
+  dira_dot_dirb = dir_a.dot(dir_b)
+  dira_dot_trans = dir_a.dot(trans)
+  dirb_dot_trans = dir_b.dot(trans)
+  denom = 1 - dira_dot_dirb * dira_dot_dirb
+
+  orig_t_a = (-dira_dot_trans + dira_dot_dirb * dirb_dot_trans) / (
+      denom + 1e-6
+  )
+  orig_t_b = dirb_dot_trans + orig_t_a * dira_dot_dirb
+  t_a = sj.clip(orig_t_a, -half_len_a, half_len_a, softness=0.01, mode=mode)
+  t_b = sj.clip(orig_t_b, -half_len_b, half_len_b, softness=0.01, mode=mode)
+
+  best_a = a_mid + dir_a * t_a
+  best_b = b_mid + dir_b * t_b
+
+  new_a, d1 = closest_segment_point_and_dist_soft(a0, a1, best_b, mode)
+  new_b, d2 = closest_segment_point_and_dist_soft(b0, b1, best_a, mode)
+  cond = sj.less(d1, d2, softness=0.01, mode=mode)
+  best_a = sj.where(cond, new_a, best_a)
+  best_b = sj.where(cond, best_b, new_b)
+
+  return best_a, best_b
 def closest_segment_point(
     a: jax.Array, b: jax.Array, pt: jax.Array
 ) -> jax.Array:

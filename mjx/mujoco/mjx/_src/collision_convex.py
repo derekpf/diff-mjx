@@ -19,6 +19,7 @@ from typing import Callable, Tuple, Union
 
 import jax
 from jax import numpy as jp
+import softjax as sj
 from mujoco.mjx._src import math
 from mujoco.mjx._src import mesh
 # pylint: disable=g-importing-member
@@ -71,6 +72,7 @@ def collider(ncon: int):
           infos[i] = hfield_info.replace(pos=infos[i].pos, mat=infos[i].mat)
           in_axes[i] = hfield_info.replace(pos=0, mat=0, data=None)
           fn = functools.partial(fn, subgrid_size=key.subgrid_size)
+      fn = functools.partial(fn, soft=m.opt.col_soft_enable, softjax_mode=m.opt.softjax_mode)
       dist, pos, frame = jax.vmap(fn, in_axes=in_axes)(*infos)  # pytype: disable=wrong-keyword-args
       if ncon > 1:
         return jax.tree_util.tree_map(jp.concatenate, (dist, pos, frame))
@@ -113,7 +115,7 @@ def _manifold_points(
     poly: jax.Array, poly_mask: jax.Array, poly_norm: jax.Array
 ) -> jax.Array:
   """Chooses four points on the polygon with approximately maximal area."""
-  dist_mask = jp.where(poly_mask, 0.0, -1e6)
+  dist_mask = sj.where(poly_mask, 0.0, -1e6)
   a_idx = jp.argmax(dist_mask)
   a = poly[a_idx]
   # choose point b furthest from a
@@ -133,9 +135,54 @@ def _manifold_points(
   d_idx = (dist_bp + dist_ap).argmax() % poly.shape[0]
   return jp.array([a_idx, b_idx, c_idx, d_idx])
 
+def _manifold_points_soft(poly: jax.Array,
+                          poly_mask: jax.Array,
+                          poly_norm: jax.Array,
+                          mode: str,
+                          softness: float) -> jax.Array:
+    """Chooses four points on the polygon with approximately maximal area using softargmax.
+    Args:
+        poly: (N, 3) array of polygon vertices
+        poly_mask: (N,) boolean array of which vertices are in contact
+        poly_norm: (3,) normal vector of the polygon plane
+        mode: softargmax mode to use
+    """
+    s, m = softness, mode
+    dist_mask = sj.where(poly_mask, 0.0, -1e6) #- 1e6 * jp.arange(poly.shape[0]) # add small bias to prefer earlier vertices in case of ties
+
+    # A: soft argmax over masked distances (picks first valid vertex)
+    a_logits = dist_mask
+    a_idx = sj.argmax(a_logits, mode=m, softness=s)
+    a = sj.dynamic_index_in_dim(poly, a_idx, axis=0, keepdims=False)
+
+    # B: soft argmax of distance from A
+    b_logits = (((a - poly) ** 2).sum(axis=1)) + dist_mask
+    b_idx = sj.argmax(b_logits, mode=m, softness=s)
+    b = sj.dynamic_index_in_dim(poly, b_idx, axis=0, keepdims=False)
+
+    # C: soft argmax farthest from AB line
+    ab = jp.cross(poly_norm, a - b)
+    ap = a - poly
+    c_logits = sj.abs(ap.dot(ab), mode=m, softness=s) + dist_mask #+ tiebreak
+    c_idx = sj.argmax(c_logits, mode=m, softness=s)
+    c = sj.dynamic_index_in_dim(poly, c_idx, axis=0, keepdims=False)
+
+    # D: softargmax farthest from AC and BC
+    ac = jp.cross(poly_norm, a - c)
+    bc = jp.cross(poly_norm, b - c)
+    bp = b - poly
+    dist_bp = sj.abs(bp.dot(bc), mode=m, softness=s) + dist_mask
+    dist_ap = sj.abs(ap.dot(ac), mode=m, softness=s) + dist_mask
+    d_logits = dist_bp + dist_ap
+    d_idx = sj.argmax(d_logits, mode=m, softness=s)
+    return jp.stack([a_idx, b_idx, c_idx, d_idx])
 
 @collider(ncon=4)
-def plane_convex(plane: GeomInfo, convex: ConvexInfo) -> Collision:
+def plane_convex(plane: GeomInfo,
+                 convex: ConvexInfo,
+                 soft: bool,
+                 softjax_mode: str,
+                 softness: float = 1e-6) -> Collision:
   """Calculates contacts between a plane and a convex object."""
   vert = convex.vert
 
@@ -143,17 +190,28 @@ def plane_convex(plane: GeomInfo, convex: ConvexInfo) -> Collision:
   plane_pos = convex.mat.T @ (plane.pos - convex.pos)
   n = convex.mat.T @ plane.mat[:, 2]
   support = (plane_pos - vert) @ n
-  # search for manifold points within a 1mm skin depth
-  idx = _manifold_points(vert, support > jp.maximum(0, support.max() - 1e-3), n)
-  pos = vert[idx]
+
+  if soft:
+    m = softjax_mode
+    smax = sj.max(support, softness=softness, mode=m)  # Pick vertex with largest penetration.
+    thresh = sj.relu(smax - 1e-3, softness=softness, mode=m)  # If (smax - 1e-3) > 0 use it to select contact points.                           │
+    poly_mask = sj.greater_equal(support, thresh, softness=softness, mode=m)
+    idx = _manifold_points_soft(vert, poly_mask, n, mode=m, softness=softness)
+    pos = idx @ vert           # (4, N) @ (N, 3) → (4, 3)                                           │
+    dist = -(idx @ support)    # (4, N) @ (N,) → (4,)
+  else:
+    # search for manifold points within a 1mm skin depth
+    idx = _manifold_points(vert, support > jp.maximum(0, support.max() - 1e-3), n)
+    pos = vert[idx]
+    dist = -support[idx]
+    unique = jp.tril(idx == idx[:, None]).sum(axis=1) == 1
+    dist = jp.where(unique, dist, 1)
 
   # convert to world frame
   pos = convex.pos + pos @ convex.mat.T
   n = plane.mat[:, 2]
 
   frame = jp.stack([math.make_frame(n)] * 4, axis=0)
-  unique = jp.tril(idx == idx[:, None]).sum(axis=1) == 1
-  dist = jp.where(unique, -support[idx], 1)
   pos = pos - 0.5 * dist[:, None] * n
   return dist, pos, frame
 
@@ -225,7 +283,7 @@ def _sphere_convex(sphere: GeomInfo, convex: ConvexInfo) -> Collision:
 
 
 @collider(ncon=1)
-def sphere_convex(sphere: GeomInfo, convex: ConvexInfo) -> Collision:
+def sphere_convex(sphere: GeomInfo, convex: ConvexInfo, soft: bool, softjax_mode: str) -> Collision:
   """Calculates contact between a sphere and a convex mesh."""
   dist, pos, n = _sphere_convex(sphere, convex)
   return dist, pos, math.make_frame(n)
@@ -357,7 +415,7 @@ def _capsule_convex(cap: GeomInfo, convex: ConvexInfo) -> Collision:
 
 
 @collider(ncon=2)
-def capsule_convex(cap: GeomInfo, convex: ConvexInfo) -> Collision:
+def capsule_convex(cap: GeomInfo, convex: ConvexInfo, soft: bool, softjax_mode: str) -> Collision:
   """Calculates contacts between a capsule and a convex object."""
   dist, pos, n = _capsule_convex(cap, convex)
   frame = jax.vmap(math.make_frame)(n)
@@ -933,16 +991,20 @@ def _convex_convex(c1: ConvexInfo, c2: ConvexInfo) -> Collision:
 
 
 @collider(ncon=4)
-def box_box(b1: ConvexInfo, b2: ConvexInfo) -> Collision:
+def box_box(b1: ConvexInfo, b2: ConvexInfo, soft: bool, softjax_mode: str) -> Collision:
   """Calculates contacts between two boxes."""
+  if soft:
+    raise NotImplementedError("Soft box-box collision not implemented")
   dist, pos, n = _box_box(b1, b2)
   frame = jax.vmap(math.make_frame)(n)
   return dist, pos, frame
 
 
 @collider(ncon=4)
-def convex_convex(c1: ConvexInfo, c2: ConvexInfo) -> Collision:
+def convex_convex(c1: ConvexInfo, c2: ConvexInfo, soft: bool, softjax_mode: str) -> Collision:
   """Calculates contacts between two convex objects."""
+  if soft:
+    raise NotImplementedError("Soft convex-convex collision not implemented")
   dist, pos, n = _convex_convex(c1, c2)
   frame = jax.vmap(math.make_frame)(n)
   return dist, pos, frame
@@ -1047,9 +1109,11 @@ def _hfield_collision(
 
 @collider(ncon=4)
 def hfield_sphere(
-    h: HFieldInfo, s: GeomInfo, subgrid_size: Tuple[int, int]
+    h: HFieldInfo, s: GeomInfo, subgrid_size: Tuple[int, int], soft: bool, softjax_mode: str
 ) -> Collision:
   """Calculates contacts between a hfield and a sphere."""
+  if soft:
+    raise NotImplementedError("Soft hfield-sphere collision not implemented")
   rbound = jp.max(s.size)
   dist, pos, n = _hfield_collision(_sphere_convex, h, s, rbound, subgrid_size)
 
@@ -1071,9 +1135,11 @@ def hfield_sphere(
 
 @collider(ncon=4)
 def hfield_capsule(
-    h: HFieldInfo, c: GeomInfo, subgrid_size: Tuple[int, int]
+    h: HFieldInfo, c: GeomInfo, subgrid_size: Tuple[int, int], soft: bool, softjax_mode: str
 ) -> Collision:
   """Calculates contacts between a hfield and a capsule."""
+  if soft:
+    raise NotImplementedError("Soft hfield-capsule collision not implemented")
   rbound = c.size[0] + c.size[1]
   dist, pos, n = _hfield_collision(_capsule_convex, h, c, rbound, subgrid_size)
 
@@ -1095,9 +1161,11 @@ def hfield_capsule(
 
 @collider(ncon=4)
 def hfield_convex(
-    h: HFieldInfo, c: ConvexInfo, subgrid_size: Tuple[int, int]
+    h: HFieldInfo, c: ConvexInfo, subgrid_size: Tuple[int, int], soft: bool, softjax_mode: str
 ) -> Collision:
   """Calculates contacts between a hfield and a capsule."""
+  if soft:
+    raise NotImplementedError("Soft hfield-convex collision not implemented")
   rbound = jp.max(c.size)
   dist, pos, n = _hfield_collision(_convex_convex, h, c, rbound, subgrid_size)
 

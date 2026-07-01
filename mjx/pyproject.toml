@@ -30,6 +30,7 @@ dependencies = [
     "etils[epath]",
     "jax",
     "jaxlib",
+    "softjax; python_version >= '3.12'",
     "mujoco>=3.10.1.dev0",
     "scipy",
     "trimesh",

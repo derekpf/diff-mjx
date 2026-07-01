@@ -251,6 +251,13 @@ def _put_option(
   fields['disableflags'] = types.DisableBit(o.disableflags)
   fields['enableflags'] = types.EnableBit(o.enableflags)
   fields['jacobian'] = types.JacobianType(o.jacobian)
+  fields['col_soft_enable'] = bool(getattr(o, 'col_soft_enable', False))
+  fields['softjax_mode'] = getattr(o, 'softjax_mode', 'hard')
+  fields['cfd_enable'] = bool(getattr(o, 'cfd_enable', False))
+  fields['cfd_solimp'] = jp.array(
+      getattr(o, 'cfd_solimp', np.array([0.9, 0.95, 0.001, 0.5, 2.0]))
+  )
+  fields['scan_loop'] = bool(getattr(o, 'scan_loop', False))
 
   option_obj = {
       types.Impl.JAX: types.OptionJAX,

@@ -20,6 +20,7 @@ from typing import Optional, Tuple, Union
 import jax
 from jax import numpy as jp
 import mujoco
+import softjax as sj
 from mujoco.introspect import mjxmacro
 from mujoco.mjx._src import math
 from mujoco.mjx._src import scan
@@ -648,7 +649,7 @@ def _length_circle(
 
   # clip input to closed interval for jp.arccos to prevent potential nan
   # TODO(taylorhowell): add test for case where clip is necessary
-  angle = jp.arccos(jp.clip(jp.dot(p0n, p1n), -1, 1))
+  angle = sj.arccos(jp.dot(p0n, p1n))
 
   # flip if necessary
   cross = p0[1] * p1[0] - p0[0] * p1[1]
@@ -666,11 +667,13 @@ def _is_intersect(
   det = (p4[1] - p3[1]) * (p2[0] - p1[0]) - (p4[0] - p3[0]) * (p2[1] - p1[1])
 
   # compute intersection point on each line
-  a = math.safe_div(
-      (p4[0] - p3[0]) * (p1[1] - p3[1]) - (p4[1] - p3[1]) * (p1[0] - p3[0]), det
+  a = sj.div(
+      (p4[0] - p3[0]) * (p1[1] - p3[1]) - (p4[1] - p3[1]) * (p1[0] - p3[0]),
+      det,
   )
-  b = math.safe_div(
-      (p2[0] - p1[0]) * (p1[1] - p3[1]) - (p2[1] - p1[1]) * (p1[0] - p3[0]), det
+  b = sj.div(
+      (p2[0] - p1[0]) * (p1[1] - p3[1]) - (p2[1] - p1[1]) * (p1[0] - p3[0]),
+      det,
   )
 
   return jp.where(
@@ -706,8 +709,8 @@ def wrap_circle(
 
   # construct the two solutions, compute goodness
   def _sol(sgn):
-    sqrt0 = jp.sqrt(jp.maximum(mujoco.mjMINVAL, sqlen0 - sqrad))
-    sqrt1 = jp.sqrt(jp.maximum(mujoco.mjMINVAL, sqlen1 - sqrad))
+    sqrt0 = sj.sqrt(sqlen0 - sqrad)
+    sqrt1 = sj.sqrt(sqlen1 - sqrad)
 
     d00 = (d[0] * sqrad + sgn * rad * d[1] * sqrt0) / jp.maximum(
         mujoco.mjMINVAL, sqlen0
@@ -822,11 +825,11 @@ def wrap_inside(
   no_wrap2 = cosG < -1 + mjMINVAL
   early_return0 = cosG > 1 - mjMINVAL
 
-  G = jp.arccos(cosG)  # pylint: disable=invalid-name
+  G = sj.arccos(cosG)  # pylint: disable=invalid-name
 
   # initialize solver
   z = jp.array([z_init])
-  f = jp.arcsin(A * z) + jp.arcsin(B * z) - 2 * jp.arcsin(z) + G
+  f = sj.arcsin(A * z) + sj.arcsin(B * z) - 2 * sj.arcsin(z) + G
 
   # make sure initialization is not on the other side
   early_return1 = f > 0
@@ -841,9 +844,9 @@ def wrap_inside(
 
     # compute derivative
     df = (
-        A / jp.maximum(mjMINVAL, jp.sqrt(1 - z * z * A * A))
-        + B / jp.maximum(mjMINVAL, jp.sqrt(1 - z * z * B * B))
-        - 2 / jp.maximum(mjMINVAL, jp.sqrt(1 - z * z))
+        A / jp.maximum(mjMINVAL, sj.sqrt(1 - z * z * A * A))
+        + B / jp.maximum(mjMINVAL, sj.sqrt(1 - z * z * B * B))
+        - 2 / jp.maximum(mjMINVAL, sj.sqrt(1 - z * z))
     )
 
     # check sign; SHOULD NOT OCCUR
@@ -857,9 +860,9 @@ def wrap_inside(
 
     # evaluate solution
     f_next = (
-        jp.arcsin(A * z_next)
-        + jp.arcsin(B * z_next)
-        - 2 * jp.arcsin(z_next)
+        sj.arcsin(A * z_next)
+        + sj.arcsin(B * z_next)
+        - 2 * sj.arcsin(z_next)
         + G
     )
 
@@ -881,7 +884,7 @@ def wrap_inside(
   sign = end[0] * end[3] - end[1] * end[2] > 0
   vec = jp.where(sign, end[:2], end[2:])
   vec = math.normalize(vec)
-  ang = jp.arcsin(z) - jp.where(sign, jp.arcsin(A * z), jp.arcsin(B * z))
+  ang = sj.arcsin(z) - jp.where(sign, sj.arcsin(A * z), sj.arcsin(B * z))
   pnt_sol = radius * jp.array([
       jp.cos(ang) * vec[0] - jp.sin(ang) * vec[1],
       jp.sin(ang) * vec[0] + jp.cos(ang) * vec[1],
@@ -973,17 +976,18 @@ def wrap(
   res = jp.concatenate([res0, res1])
 
   # perform correction for cylinder case
-  l0 = jp.sqrt(
+  l0 = sj.sqrt(
       (p0[0] - res[0]) * (p0[0] - res[0]) + (p0[1] - res[1]) * (p0[1] - res[1])
   )
-  l1 = jp.sqrt(
+  l1 = sj.sqrt(
       (p1[0] - res[3]) * (p1[0] - res[3]) + (p1[1] - res[4]) * (p1[1] - res[4])
   )
-  r2 = p0[2] + (p1[2] - p0[2]) * math.safe_div(l0, l0 + wlen + l1)
-  r5 = p0[2] + (p1[2] - p0[2]) * math.safe_div(l0 + wlen, l0 + wlen + l1)
+  denom = l0 + wlen + l1
+  r2 = p0[2] + sj.div((p1[2] - p0[2]) * l0, denom)
+  r5 = p0[2] + sj.div((p1[2] - p0[2]) * (l0 + wlen), denom)
   height = jp.abs(r5 - r2)
 
-  wlen = jp.where(is_sphere, wlen, jp.sqrt(wlen * wlen + height * height))
+  wlen = jp.where(is_sphere, wlen, sj.sqrt(wlen * wlen + height * height))
   res = jp.where(
       is_sphere, res, res.at[jp.array([2, 5])].set(jp.concatenate([r2, r5]))
   )
@@ -1122,7 +1126,7 @@ def muscle_dynamics_timescale(
   # smooth switching
   # scale by width, center around 0.5 midpoint, rescale to bounds
   tau_smooth = tau_deact + (tau_act - tau_deact) * _sigmoid(
-      math.safe_div(dctrl, smoothing_width) + 0.5
+      sj.div(dctrl, smoothing_width) + 0.5
   )
 
   return jp.where(smoothing_width < mujoco.mjMINVAL, tau_hard, tau_smooth)
@@ -1141,7 +1145,7 @@ def muscle_dynamics(
   # compute timescales as in Millard et at. (2013)
   # https://doi.org/10.1115/1.4023390
   tau_act = prm[0] * (0.5 + 1.5 * actclamp)  # activation timescale
-  tau_deact = prm[1] / (0.5 + 1.5 * actclamp)  # deactivation timescale
+  tau_deact = sj.div(prm[1], 0.5 + 1.5 * actclamp)  # deactivation timescale
   smoothing_width = prm[2]  # width of smoothing sigmoid
   dctrl = ctrlclamp - act  # excess excitation
 

@@ -49,6 +49,7 @@ class _Efc(PyTreeNode):
   invweight: jax.Array
   solref: jax.Array
   solimp: jax.Array
+  _dmax: jax.Array
   margin: jax.Array
   frictionloss: jax.Array
 
@@ -57,9 +58,14 @@ def _kbi(
     m: Model,
     solref: jax.Array,
     solimp: jax.Array,
-    pos: jax.Array,
+    _dmax: jax.Array,
+    pos: Optional[jax.Array] = None,
 ) -> Tuple[jax.Array, jax.Array, jax.Array]:
   """Calculates stiffness, damping, and impedance of a constraint."""
+  if pos is None:
+    pos = _dmax
+    _dmax = solimp[1]
+
   timeconst, dampratio = solref
 
   if not m.opt.disableflags & DisableBit.REFSAFE:
@@ -73,12 +79,14 @@ def _kbi(
   mid = jp.clip(mid, mujoco.mjMINIMP, mujoco.mjMAXIMP)
   power = jp.maximum(1, power)
 
+  _dmax = jp.clip(_dmax, mujoco.mjMINIMP, mujoco.mjMAXIMP)
+
   # See https://mujoco.readthedocs.io/en/latest/modeling.html#solver-parameters
-  k = 1 / (dmax * dmax * timeconst * timeconst * dampratio * dampratio)
-  b = 2 / (dmax * timeconst)
+  k = 1 / (_dmax * _dmax * timeconst * timeconst * dampratio * dampratio)
+  b = 2 / (_dmax * timeconst)
   # TODO(robotics-simulation): check various solparam settings in model gen test
-  k = jp.where(solref[0] <= 0, -solref[0] / (dmax * dmax), k)
-  b = jp.where(solref[1] <= 0, -solref[1] / dmax, b)
+  k = jp.where(solref[0] <= 0, -solref[0] / (_dmax * _dmax), k)
+  b = jp.where(solref[1] <= 0, -solref[1] / _dmax, b)
 
   imp_x = jp.abs(pos) / width
   imp_a = (1.0 / jp.power(mid, power - 1)) * jp.power(imp_x, power)
@@ -134,7 +142,7 @@ def _efc_equality_connect(m: Model, d: Data) -> Optional[_Efc]:
     invweight = m.body_invweight0[body1id, 0] + m.body_invweight0[body2id, 0]
     zero = jp.zeros_like(pos)
 
-    efc = _row(j, pos, pos_imp, invweight, solref, solimp, zero, zero)
+    efc = _row(j, pos, pos_imp, invweight, solref, solimp, solimp[1], zero, zero)
     return jax.tree_util.tree_map(lambda x: x * active, efc)
 
   is_site = m.eq_objtype == ObjType.SITE
@@ -218,7 +226,7 @@ def _efc_equality_weld(m: Model, d: Data) -> Optional[_Efc]:
     invweight = jp.repeat(invweight, 3, axis=0)
     zero = jp.zeros_like(pos)
 
-    efc = _row(j, pos, pos_imp, invweight, solref, solimp, zero, zero)
+    efc = _row(j, pos, pos_imp, invweight, solref, solimp, solimp[1], zero, zero)
     return jax.tree_util.tree_map(lambda x: x * active, efc)
 
   is_site = m.eq_objtype == ObjType.SITE
@@ -269,7 +277,7 @@ def _efc_equality_joint(m: Model, d: Data) -> Optional[_Efc]:
     invweight += m.dof_invweight0[dofadr2] * (obj2id > -1)
     zero = jp.zeros_like(pos)
 
-    efc = _row(j, pos, pos, invweight, solref, solimp, zero, zero)
+    efc = _row(j, pos, pos, invweight, solref, solimp, solimp[1], zero, zero)
     return jax.tree_util.tree_map(lambda x: x * active, efc)
 
   args = (m.eq_obj1id, m.eq_obj2id, m.eq_data, m.eq_solref, m.eq_solimp)
@@ -317,7 +325,7 @@ def _efc_equality_tendon(m: Model, d: Data) -> Optional[_Efc]:
     j = jac1 + jac2 * -deriv
     zero = jp.zeros_like(pos)
 
-    efc = _row(j, pos, pos, invweight, solref, solimp, zero, zero)
+    efc = _row(j, pos, pos, invweight, solref, solimp, solimp[1], zero, zero)
     return jax.tree_util.tree_map(lambda x: x * active, efc)
 
   inv1, inv2 = m.tendon_invweight0[obj1id], m.tendon_invweight0[obj2id]
@@ -358,12 +366,12 @@ def _efc_friction(m: Model, d: Data) -> Optional[_Efc]:
   @jax.vmap
   def rows(j, frictionloss, invweight, solref, solimp):
     z = jp.zeros_like(frictionloss)
-    return _row(j, z, z, invweight, solref, solimp, z, frictionloss)
+    return _row(j, z, z, invweight, solref, solimp, solimp[1], z, frictionloss)
 
   return rows(*args)
 
 
-def _efc_limit_ball(m: Model, d: Data) -> Optional[_Efc]:
+def _efc_limit_ball(m: Model, d: Data, soft: bool) -> Optional[_Efc]:
   """Calculates constraint rows for ball joint limits."""
 
   jnt_id = np.nonzero((m.jnt_type == JointType.BALL) & m.jnt_limited)[0]
@@ -376,14 +384,17 @@ def _efc_limit_ball(m: Model, d: Data) -> Optional[_Efc]:
     axis, angle = math.quat_to_axis_angle(d.qpos[jp.arange(4) + qposadr])
     # ball rotation angle is always positive
     axis, angle = math.normalize_with_norm(axis * angle)
-    pos = jp.amax(jnt_range) - angle - jnt_margin
-    active = pos < 0
+    pos_aref = jp.amax(jnt_range) - angle - jnt_margin
+
+    pos_imp = pos_aref
+    active = pos_imp < 0
+
     j = jp.zeros(m.nv).at[jp.arange(3) + dofadr].set(-axis)
     invweight = m.dof_invweight0[dofadr]
-    z = jp.zeros_like(pos)
+    z = jp.zeros_like(pos_aref)
 
     return _row(
-        j * active, pos * active, pos, invweight, solref, solimp, jnt_margin, z
+        j * active, pos_aref * active, pos_imp, invweight, solref, solimp, solimp[1], jnt_margin, z
     )
 
   args = (m.jnt_qposadr, m.jnt_dofadr, m.jnt_range, m.jnt_margin, m.jnt_solref)
@@ -393,7 +404,7 @@ def _efc_limit_ball(m: Model, d: Data) -> Optional[_Efc]:
   return rows(*args)
 
 
-def _efc_limit_slide_hinge(m: Model, d: Data) -> Optional[_Efc]:
+def _efc_limit_slide_hinge(m: Model, d: Data, soft: bool) -> Optional[_Efc]:
   """Calculates constraint rows for slide and hinge joint limits."""
 
   slide_hinge = np.isin(m.jnt_type, (JointType.SLIDE, JointType.HINGE))
@@ -406,14 +417,17 @@ def _efc_limit_slide_hinge(m: Model, d: Data) -> Optional[_Efc]:
   def rows(qposadr, dofadr, jnt_range, jnt_margin, solref, solimp):
     qpos = d.qpos[qposadr]
     dist_min, dist_max = qpos - jnt_range[0], jnt_range[1] - qpos
-    pos = jp.minimum(dist_min, dist_max) - jnt_margin
-    active = pos < 0
+    pos_aref = jp.minimum(dist_min, dist_max) - jnt_margin
+
+    pos_imp = pos_aref
+    active = pos_imp < 0
+
     j = jp.zeros(m.nv).at[dofadr].set((dist_min < dist_max) * 2 - 1)
     invweight = m.dof_invweight0[dofadr]
-    z = jp.zeros_like(pos)
+    z = jp.zeros_like(pos_aref)
 
     return _row(
-        j * active, pos * active, pos, invweight, solref, solimp, jnt_margin, z
+        j * active, pos_aref * active, pos_imp, invweight, solref, solimp, solimp[1], jnt_margin, z
     )
 
   args = (m.jnt_qposadr, m.jnt_dofadr, m.jnt_range, m.jnt_margin, m.jnt_solref)
@@ -423,7 +437,7 @@ def _efc_limit_slide_hinge(m: Model, d: Data) -> Optional[_Efc]:
   return rows(*args)
 
 
-def _efc_limit_tendon(m: Model, d: Data) -> Optional[_Efc]:
+def _efc_limit_tendon(m: Model, d: Data, soft: bool) -> Optional[_Efc]:
   """Calculates constraint rows for tendon limits."""
   if not isinstance(m._impl, ModelJAX) or not isinstance(d._impl, DataJAX):
     raise ValueError('_efc_limit_tendon requires JAX backend implementation.')
@@ -447,17 +461,20 @@ def _efc_limit_tendon(m: Model, d: Data) -> Optional[_Efc]:
   )
 
   dist_min, dist_max = length - range_[:, 0], range_[:, 1] - length
-  pos = jp.minimum(dist_min, dist_max) - margin
-  active = pos < 0
+  pos_aref = jp.minimum(dist_min, dist_max) - margin
+
+  pos_imp = pos_aref
+  active = pos_imp < 0
+
   j = jax.vmap(jp.multiply)(j, ((dist_min < dist_max) * 2 - 1) * active)
-  zero = jp.zeros_like(pos)
+  zero = jp.zeros_like(pos_aref)
 
   return jax.vmap(_row)(
-      j, pos * active, pos, invweight, solref, solimp, margin, zero
+      j, pos_aref * active, pos_imp, invweight, solref, solimp, solimp[:, 1], margin, zero
   )
 
 
-def _efc_contact_frictionless(m: Model, d: Data) -> Optional[_Efc]:
+def _efc_contact_frictionless(m: Model, d: Data, soft: bool) -> Optional[_Efc]:
   """Calculates constraint rows for frictionless contacts."""
   if not isinstance(m._impl, ModelJAX) or not isinstance(d._impl, DataJAX):
     raise ValueError(
@@ -471,8 +488,16 @@ def _efc_contact_frictionless(m: Model, d: Data) -> Optional[_Efc]:
 
   @jax.vmap
   def rows(c: Contact):
-    pos = c.dist - c.includemargin
-    active = pos < 0
+    pos_aref = c.dist - c.includemargin
+
+    if soft:
+      pos_imp = jp.where(pos_aref < 0, pos_aref, pos_aref - m.opt.cfd_solimp[2])
+      solimp = jp.where(pos_aref < 0, c.solimp, jp.array(m.opt.cfd_solimp))
+    else:
+      pos_imp = pos_aref
+      solimp = c.solimp
+    active = pos_imp < 0
+
     body1, body2 = jp.array(m.geom_bodyid)[c.geom]
     jac1p, _ = support.jac(m, d, c.pos, body1)
     jac2p, _ = support.jac(m, d, c.pos, body2)
@@ -481,13 +506,14 @@ def _efc_contact_frictionless(m: Model, d: Data) -> Optional[_Efc]:
 
     return _row(
         j * active,
-        pos * active,
-        pos,
+        pos_aref * active,
+        pos_imp,
         invweight,
         c.solref,
-        c.solimp,
+        solimp,
+        c.solimp[1],
         c.includemargin,
-        jp.zeros_like(pos),
+        jp.zeros_like(pos_aref),
     )
 
   contact = jax.tree_util.tree_map(lambda x: x[con_id], d._impl.contact)
@@ -495,7 +521,7 @@ def _efc_contact_frictionless(m: Model, d: Data) -> Optional[_Efc]:
   return rows(contact)
 
 
-def _efc_contact_pyramidal(m: Model, d: Data, condim: int) -> Optional[_Efc]:
+def _efc_contact_pyramidal(m: Model, d: Data, condim: int, soft: bool) -> Optional[_Efc]:
   """Calculates constraint rows for frictional pyramidal contacts."""
   if (
       not isinstance(m._impl, ModelJAX)
@@ -513,8 +539,16 @@ def _efc_contact_pyramidal(m: Model, d: Data, condim: int) -> Optional[_Efc]:
 
   @jax.vmap
   def rows(c: Contact):
-    pos = c.dist - c.includemargin
-    active = pos < 0
+    pos_aref = c.dist - c.includemargin
+
+    if soft:
+      pos_imp = jp.where(pos_aref < 0, pos_aref, pos_aref - m.opt.cfd_solimp[2])
+      solimp = jp.where(pos_aref < 0, c.solimp, jp.array(m.opt.cfd_solimp))
+    else:
+      pos_imp = pos_aref
+      solimp = c.solimp
+    active = pos_imp < 0
+
     body1, body2 = jp.array(m.geom_bodyid)[c.geom]
     jac1p, jac1r = support.jac(m, d, c.pos, body1)
     jac2p, jac2r = support.jac(m, d, c.pos, body2)
@@ -534,13 +568,14 @@ def _efc_contact_pyramidal(m: Model, d: Data, condim: int) -> Optional[_Efc]:
 
     return _row(
         j * active,
-        pos * active,
-        pos,
+        pos_aref * active,
+        pos_imp,
         invweight,
         c.solref,
-        c.solimp,
+        solimp,
+        c.solimp[1],
         c.includemargin,
-        jp.zeros_like(pos),
+        jp.zeros_like(pos_aref),
     )
 
   contact = jax.tree_util.tree_map(lambda x: x[con_id], d._impl.contact)
@@ -548,7 +583,7 @@ def _efc_contact_pyramidal(m: Model, d: Data, condim: int) -> Optional[_Efc]:
   return jax.tree_util.tree_map(jp.concatenate, rows(contact))
 
 
-def _efc_contact_elliptic(m: Model, d: Data, condim: int) -> Optional[_Efc]:
+def _efc_contact_elliptic(m: Model, d: Data, condim: int, soft: bool) -> Optional[_Efc]:
   """Calculates constraint rows for frictional elliptic contacts."""
   if (
       not isinstance(m._impl, ModelJAX)
@@ -566,8 +601,16 @@ def _efc_contact_elliptic(m: Model, d: Data, condim: int) -> Optional[_Efc]:
 
   @jax.vmap
   def rows(c: Contact):
-    pos = c.dist - c.includemargin
-    active = pos < 0
+    pos_aref = c.dist - c.includemargin
+
+    if soft:
+      pos_imp = jp.where(pos_aref < 0, pos_aref, pos_aref - m.opt.cfd_solimp[2])
+      solimp = jp.where(pos_aref < 0, c.solimp, jp.array(m.opt.cfd_solimp))
+    else:
+      pos_imp = pos_aref
+      solimp = c.solimp
+    active = pos_imp < 0
+
     obj1id, obj2id = jp.array(m.geom_bodyid)[c.geom]
     jac1p, jac1r = support.jac(m, d, c.pos, obj1id)
     jac2p, jac2r = support.jac(m, d, c.pos, obj2id)
@@ -583,17 +626,18 @@ def _efc_contact_elliptic(m: Model, d: Data, condim: int) -> Optional[_Efc]:
     fri = jp.square(c.friction[0]) / jp.square(c.friction[1 : condim - 1])
     invweight = jp.array([invweight, invweight / m.opt.impratio])
     invweight = jp.concatenate((invweight, invweight[1] * fri))
-    pos_aref = jp.zeros(condim).at[0].set(pos)
+    pos_aref = jp.zeros(condim).at[0].set(pos_aref)
 
     return _row(
         j * active,
         pos_aref * active,
-        pos,
+        pos_imp,
         invweight,
         solref,
-        c.solimp,
+        solimp,
+        c.solimp[1],
         c.includemargin,
-        jp.zeros_like(pos),
+        jp.zeros_like(pos_aref),
     )
 
   contact = jax.tree_util.tree_map(lambda x: x[con_id], d._impl.contact)
@@ -689,8 +733,7 @@ def make_efc_address(
 
   return address
 
-
-def make_constraint(m: Model, d: Data) -> Data:
+def make_constraint(m: Model, d: Data, soft: bool = False) -> Data:
   """Creates constraint jacobians and other supporting data."""
 
   if m.opt.disableflags & DisableBit.CONSTRAINT:
@@ -702,16 +745,16 @@ def make_constraint(m: Model, d: Data) -> Data:
         _efc_equality_joint(m, d),
         _efc_equality_tendon(m, d),
         _efc_friction(m, d),
-        _efc_limit_ball(m, d),
-        _efc_limit_slide_hinge(m, d),
-        _efc_limit_tendon(m, d),
-        _efc_contact_frictionless(m, d),
+        _efc_limit_ball(m, d, soft=soft),
+        _efc_limit_slide_hinge(m, d, soft=soft),
+        _efc_limit_tendon(m, d, soft=soft),
+        _efc_contact_frictionless(m, d, soft=soft),
     )
     if m.opt.cone == ConeType.ELLIPTIC:
       con_fn = _efc_contact_elliptic
     else:
       con_fn = _efc_contact_pyramidal
-    efcs += tuple(con_fn(m, d, dim) for dim in (3, 4, 6))
+    efcs += tuple(con_fn(m, d, dim, soft=soft) for dim in (3, 4, 6))
     efcs = tuple(efc for efc in efcs if efc is not None)
 
   if not efcs:
@@ -730,9 +773,10 @@ def make_constraint(m: Model, d: Data) -> Data:
 
   @jax.vmap
   def fn(efc):
-    k, b, imp = _kbi(m, efc.solref, efc.solimp, efc.pos_imp)
+    k, b, imp = _kbi(m, efc.solref, efc.solimp, efc._dmax, efc.pos_imp)
     r = jp.maximum(efc.invweight * (1 - imp) / imp, mujoco.mjMINVAL)
-    aref = -b * (efc.J @ d.qvel) - k * imp * efc.pos_aref
+    pos_aref = -jax.nn.relu(-efc.pos_aref) if soft else efc.pos_aref
+    aref = -b * (efc.J @ d.qvel) - k * imp * pos_aref
     return aref, r, efc.pos_aref + efc.margin, efc.margin, efc.frictionloss
 
   aref, r, pos, margin, frictionloss = fn(efc)

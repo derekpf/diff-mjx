@@ -17,6 +17,7 @@
 import jax
 from jax import numpy as jp
 import mujoco
+import softjax as sj
 from mujoco.mjx._src import math
 from mujoco.mjx._src import smooth
 from mujoco.mjx._src import support
@@ -180,7 +181,7 @@ class _LSPoint(PyTreeNode):
       mu, u0 = ctx.fri[:, 0], ctx.u[:, 0]
       n = u0 + alpha * v0
       tsqr = uu + alpha * (2 * uv + alpha * vv)
-      t = jp.sqrt(tsqr)  # tangential force
+      t = sj.sqrt(tsqr)  # tangential force
 
       bottom_zone = ((tsqr <= 0) & (n < 0)) | ((tsqr > 0) & ((mu * n + t) <= 0))
       middle_zone = (tsqr > 0) & (n < (mu * t)) & ((mu * n + t) > 0)
@@ -539,7 +540,10 @@ def _linesearch(m: Model, d: Data, ctx: Context) -> Context:
   hi = jax.tree_util.tree_map(lesser_fn, p0, lo)
   lo = jax.tree_util.tree_map(lesser_fn, lo, p0)
   ls_ctx = _LSContext(lo=lo, hi=hi, swap=jp.array(True), ls_iter=0)
-  ls_ctx = _while_loop_scan(cond, body, ls_ctx, m.opt.ls_iterations)
+  if m.opt.scan_loop:
+    ls_ctx = _while_loop_scan(cond, body, ls_ctx, m.opt.ls_iterations)
+  else:
+    ls_ctx = jax.lax.while_loop(cond, body, ls_ctx)
 
   # move to new solution if improved
   lo, hi = ls_ctx.lo, ls_ctx.hi
@@ -599,7 +603,10 @@ def solve(m: Model, d: Data) -> Data:
   if m.opt.iterations == 1:
     ctx = body(ctx)
   else:
-    ctx = jax.lax.while_loop(cond, body, ctx)
+    if m.opt.scan_loop:
+      ctx = _while_loop_scan(cond, body, ctx, max_iter=m.opt.iterations)
+    else:
+      ctx = jax.lax.while_loop(cond, body, ctx)
 
   d = d.tree_replace({
       'qfrc_constraint': ctx.qfrc_constraint,

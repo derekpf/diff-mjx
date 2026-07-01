@@ -510,6 +510,11 @@ class Option(PyTreeNode):
   integrator: IntegratorType
   solver: SolverType
   timestep: jax.Array
+  col_soft_enable: bool
+  softjax_mode: str
+  cfd_enable: bool
+  cfd_solimp: jax.Array
+  scan_loop: bool
   _impl: Union[OptionJAX, mjxw_types.OptionWarp]
 
 
