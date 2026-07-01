@@ -16,29 +16,34 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 
 #include <mujoco/mujoco.h>
 
+
 // help
 static constexpr char helpstring[] =
-  "\n Usage:  compile infile outfile\n"
+  "\n Usage:  compile infile [outfile]\n"
   "   infile can be in mjcf, urdf, mjb format\n"
-  "   outfile can be in mjcf, mjb, txt format, or empty\n\n"
-  "   if infile is mjcf, compilation will be timed twice to measure the impact of caching\n\n"
+  "   outfile can be in mjcf, mjb, txt format\n\n"
+  "   if infile is mjcf or urdf and outfile is omitted, a detailed\n"
+  "   timing breakdown is printed for two compilations (cold and warm cache)\n\n"
   " Example: compile model.xml [model.mjb]\n";
 
+
 // timer (seconds)
-mjtNum gettm(void) {
+double gettm(void) {
   using Clock = std::chrono::steady_clock;
-  using Seconds = std::chrono::duration<mjtNum>;
+  using Seconds = std::chrono::duration<double>;
   static const Clock::time_point tm_start = Clock::now();
   return Seconds(Clock::now() - tm_start).count();
 }
 
+
 // deallocate and print message
-int finish(const char* msg = 0, mjModel* m = 0) {
+int finish(const char* msg = 0, int exitcode = EXIT_SUCCESS, mjModel* m = 0) {
   // deallocated everything
   if (m) {
     mj_deleteModel(m);
@@ -49,7 +54,7 @@ int finish(const char* msg = 0, mjModel* m = 0) {
     std::cout << msg << std::endl;
   }
 
-  return 0;
+  return exitcode;
 }
 
 
@@ -98,7 +103,6 @@ int filetype(const char* filename) {
 }
 
 
-
 // main function
 int main(int argc, char** argv) {
 
@@ -108,7 +112,7 @@ int main(int argc, char** argv) {
 
   // print help if arguments are missing
   if (argc!=3 && argc!=2) {
-    return finish(helpstring);
+    return finish(helpstring, EXIT_FAILURE);
   }
 
   // determine file types
@@ -116,9 +120,9 @@ int main(int argc, char** argv) {
   int type2 = argc==2 ? typeNONE : filetype(argv[2]);
 
   // check types
-  if (type1==typeUNKNOWN || type1==typeTXT ||
-      type2==typeUNKNOWN || (type1==typeMJB && type2==typeXML)) {
-    return finish("Illegal combination of file formats");
+  if (type1 == typeUNKNOWN || type1 == typeTXT ||
+      type2 == typeUNKNOWN || (type1 == typeMJB && type2 == typeXML)) {
+    return finish("Illegal combination of file formats", EXIT_FAILURE);
   }
 
   // check if output file exists
@@ -133,17 +137,35 @@ int main(int argc, char** argv) {
     }
   }
 
+  // enable compile timing diagnostics
+  if (type2 == typeNONE) {
+    mjLogConfig config = mju_getLogConfig();
+    config.logfile[0] = '\0';
+    config.topics |= (1 << (mjTOPIC_TIME_CMP - 1));
+    mju_setLogConfig(config);
+  }
+
   // load model
-  double first=0, second=0;
+  mjSpec* s = nullptr;
   if (type1==typeXML) {
-    double starttime = gettm();
-    m = mj_loadXML(argv[1], 0, error, 1000);
-    first = gettm() - starttime;
-    if (m) {
+    s = mj_parseXML(argv[1], 0, error, 1000);
+    if (!s) {
+      return finish(error, EXIT_FAILURE);
+    }
+
+    if (type2 == typeNONE) {
+      std::cout << "Compile 1 (cold cache)\n";
+    }
+    m = mj_compile(s, 0);
+    if (!m) {
+      mj_deleteSpec(s);
+      return finish("Could not compile model", EXIT_FAILURE);
+    }
+
+    if (type2 == typeNONE) {
       mj_deleteModel(m);
-      starttime = gettm();
-      m = mj_loadXML(argv[1], 0, error, 1000);
-      second = gettm() - starttime;
+      std::cout << "Compile 2 (warm cache)\n";
+      m = mj_compile(s, 0);
     }
   } else {
     m = mj_loadModel(argv[1], 0);
@@ -151,34 +173,23 @@ int main(int argc, char** argv) {
 
   // check error
   if (!m) {
-    if (type1==typeXML) {
-      return finish(error, 0);
-    } else {
-      return finish("Could not load model", 0);
-    }
+    if (s) mj_deleteSpec(s);
+    return finish("Could not load model", EXIT_FAILURE);
   }
 
   // save model
-  if (type2==typeXML) {
+  if (type2 == typeXML) {
     if (!mj_saveLastXML(argv[2], m, error, 1000)) {
-      return finish(error, m);
+      if (s) mj_deleteSpec(s);
+      return finish(error, EXIT_FAILURE, m);
     }
-  } else if (type2==typeMJB) {
+  } else if (type2 == typeMJB) {
     mj_saveModel(m, argv[2], 0, 0);
-  } else if (type2==typeTXT) {
+  } else if (type2 == typeTXT) {
     mj_printModel(m, argv[2]);
   }
 
   // finalize
-  char msg[1000];
-  if (first) {
-    snprintf(msg, sizeof(msg), "Done.\n"
-             "First compile: %.4gs\n"
-             "Second compile: %.4gs",
-             first, second);
-  } else {
-    snprintf(msg, sizeof(msg), "Done.");
-  }
-
-  return finish(msg, m);
+  if (s) mj_deleteSpec(s);
+  return finish("Done.", EXIT_SUCCESS, m);
 }

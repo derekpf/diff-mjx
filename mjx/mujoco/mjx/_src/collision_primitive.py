@@ -119,7 +119,7 @@ def plane_ellipsoid(plane: GeomInfo, ellipsoid: GeomInfo, soft: bool, softjax_mo
 
 @collider(ncon=3)
 def plane_cylinder(plane: GeomInfo, cylinder: GeomInfo, soft: bool, softjax_mode: str) -> Collision:
-  """Calculates one contact between an cylinder and a plane."""
+  """Calculates three contacts between a cylinder and a plane."""
   n = plane.mat[:, 2]
   axis = cylinder.mat[:, 2]
 
@@ -142,7 +142,7 @@ def plane_cylinder(plane: GeomInfo, cylinder: GeomInfo, soft: bool, softjax_mode
     len_ = math.norm(vec)
   if soft:
     cond = sj.less(len_, 1e-12, softness=1e-6, mode=softjax_mode)
-    # guard denominator so sj.where's false branch doesn't produce NaN grads
+    # guard denominator so sj.where false branch does not produce NaN grads
     safe_len = len_ + 1e-6 * (len_ == 0.0)
     vec = sj.where(
         cond,
@@ -158,7 +158,7 @@ def plane_cylinder(plane: GeomInfo, cylinder: GeomInfo, soft: bool, softjax_mode
         # disk parallel to plane: pick x-axis of cylinder, scale by radius
         cylinder.mat[:, 0] * cylinder.size[0],
         # general configuration: normalize vector, scale by radius
-        vec / len_ * cylinder.size[0],
+        math.safe_div(vec, len_) * cylinder.size[0],
     )
 
   # project vector on normal

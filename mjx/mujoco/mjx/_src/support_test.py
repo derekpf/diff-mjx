@@ -64,7 +64,7 @@ class SupportTest(parameterized.TestCase):
     dx = mjx.put_data(m, d)
     mjx_full_m = jax.jit(support.full_m)(mx, dx)
     mj_full_m = np.zeros((m.nv, m.nv), dtype=np.float64)
-    mujoco.mj_fullM(m, mj_full_m, d.qM)
+    mujoco.mju_sym2dense(mj_full_m, d.M, m.M_rownnz, m.M_rowadr, m.M_colind)
     np.testing.assert_allclose(mjx_full_m, mj_full_m, atol=5e-5, rtol=5e-5)
 
   @parameterized.parameters('constraints.xml', 'pendula.xml')
@@ -173,6 +173,8 @@ class SupportTest(parameterized.TestCase):
             <joint axis="0 0 1" type="slide" name="joint3"/>
             <geom size="7 8 9" type="box" name="geom3"/>
           </body>
+          <body pos="100 110 120" name="body4" mocap="true"/>
+          <body pos="130 140 150" name="body5" mocap="true"/>
         </worldbody>
 
         <actuator>
@@ -247,6 +249,11 @@ class SupportTest(parameterized.TestCase):
           dx.bind(mx, s.joints[i]).qacc,
           d.qacc[m.jnt_dofadr[i]:m.jnt_dofadr[i] + dofnum[i]], decimal=6
       )
+      np.testing.assert_array_almost_equal(
+          dx.bind(mx, s.joints[i]).qfrc_actuator,
+          d.qfrc_actuator[m.jnt_dofadr[i] : m.jnt_dofadr[i] + dofnum[i]],
+          decimal=6,
+      )
 
     np.testing.assert_array_equal(dx.bind(mx, s.actuators).ctrl, d.ctrl)
     for i in range(m.nu):
@@ -308,6 +315,26 @@ class SupportTest(parameterized.TestCase):
       np.testing.assert_array_equal(
           dx7.bind(mx, body).xfrc_applied, [0, 0, 0, 0, 0, 0]
       )
+    dx10 = dx.bind(mx, s.bodies[0:2]).set(
+        'xfrc_applied',
+        np.array([np.array([1, 1, 1, 1, 1, 1]), np.array([2, 2, 2, 2, 2, 2])]),
+    )
+    np.testing.assert_array_equal(
+        dx10.bind(mx, s.bodies[0]).xfrc_applied, [1, 1, 1, 1, 1, 1]
+    )
+    np.testing.assert_array_equal(
+        dx10.bind(mx, s.bodies[1]).xfrc_applied, [2, 2, 2, 2, 2, 2]
+    )
+    dx11 = dx.bind(mx, s.bodies[-1]).set(
+        'mocap_pos',
+        [1, 2, 3],
+    )
+    np.testing.assert_array_equal(
+        dx11.bind(mx, s.bodies[-2]).mocap_pos, [100, 110, 120]
+    )
+    np.testing.assert_array_equal(
+        dx11.bind(mx, s.bodies[-1]).mocap_pos, [1, 2, 3]
+    )
 
     # test attribute and type mismatches
     with self.assertRaisesRegex(
@@ -322,7 +349,7 @@ class SupportTest(parameterized.TestCase):
     ):
       print(dx.bind(mx, s.actuators).set('actuator_ctrl', [1, 2, 3]))
     with self.assertRaisesRegex(
-        AttributeError, 'qpos, qvel, qacc are not available for this type'
+        AttributeError, 'qpos, qvel, qacc, qfrc are not available for this type'
     ):
       print(dx.bind(mx, s.geoms).qpos)
 
@@ -349,8 +376,21 @@ class SupportTest(parameterized.TestCase):
     self.assertEqual(
         str(e.exception),
         'mjSpec signature does not match mjx.Model signature:'
-        ' 17856615236057737915 != 12517827274439268436',
+        ' 15297169659434471387 != 2785811613804955188',
     )
+
+    # what happens when we bind to an actuator that was removed?
+    bygone_actuators = []
+    for act in s.actuators:
+      bygone_actuators.append(act)
+      s.delete(act)
+    m = s.compile()
+    d = mujoco.MjData(m)
+    mx = mjx.put_model(m)
+    dx = mjx.put_data(m, d)
+    dx = mjx.step(mx, dx)
+    with self.assertRaisesRegex(KeyError, 'invalid id: -1'):
+      dx.bind(mx, bygone_actuators)
 
   _CONTACTS = """
     <mujoco>
@@ -385,7 +425,7 @@ class SupportTest(parameterized.TestCase):
 
     # map MJX contacts to MJ ones
     def _find(g):
-      val = (g == dx.contact.geom).sum(axis=1)
+      val = (g == dx._impl.contact.geom).sum(axis=1)
       return np.where(val == 2)[0][0]
 
     contact_id_map = {i: _find(d.contact.geom[i]) for i in range(d.ncon)}
@@ -399,7 +439,7 @@ class SupportTest(parameterized.TestCase):
       np.testing.assert_allclose(result, force, rtol=1e-5, atol=2)
 
       # check for zeros after first condim elements
-      condim = dx.contact.dim[j]
+      condim = dx._impl.contact.dim[j]
       if condim < 6:
         np.testing.assert_allclose(force[condim:], 0, rtol=1e-5, atol=1e-5)
 
@@ -412,8 +452,8 @@ class SupportTest(parameterized.TestCase):
           ),
       )(mx, dx, j, True)
       # back to contact frame
-      force = force.at[:3].set(dx.contact.frame[j] @ force[:3])
-      force = force.at[3:].set(dx.contact.frame[j] @ force[3:])
+      force = force.at[:3].set(dx._impl.contact.frame[j] @ force[:3])
+      force = force.at[3:].set(dx._impl.contact.frame[j] @ force[3:])
       np.testing.assert_allclose(result, force, rtol=1e-5, atol=2)
 
   def test_wrap_inside(self):

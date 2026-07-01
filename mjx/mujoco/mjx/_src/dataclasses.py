@@ -16,12 +16,40 @@
 
 import copy
 import dataclasses
+import hashlib
 import typing
 from typing import Dict, Optional, Sequence, Tuple, TypeVar, Union
 import jax
 import numpy as np
 
 _T = TypeVar('_T')
+
+
+class _NumPyArrayHashWrapper:
+  """A wrapper for NumPy arrays to make them hashable based on content.
+
+  This class is used to allow NumPy arrays to be part of the metadata in a Jax
+  PyTree registration, as metadata must be hashable. The hash is based on the
+  array's content, dtype, and shape.
+  """
+  __slots__ = ('_hash_key', 'array')
+
+  def __init__(self, arr: np.ndarray):
+    if arr.size == 0:
+      h = hashlib.sha256(b'').hexdigest()
+    else:
+      contiguous = np.ascontiguousarray(arr)
+      h = hashlib.sha256(contiguous.data.cast('B')).hexdigest()
+    self._hash_key = (h, arr.dtype, arr.shape)
+    self.array = arr
+
+  def __hash__(self):
+    return hash(self._hash_key)
+
+  def __eq__(self, other):
+    if not isinstance(other, _NumPyArrayHashWrapper):
+      return NotImplemented
+    return self._hash_key == other._hash_key
 
 
 def _jax_in_args(typ) -> bool:
@@ -61,11 +89,17 @@ def dataclass(clz: _T, register_as_pytree: bool) -> _T:
     def iterate_clz_with_keys(x):
       def to_meta(field, obj):
         val = getattr(obj, field.name)
-        # numpy arrays are not hashable so return raw bytes instead
         if isinstance(val, np.ndarray):
-          return (val.tobytes(), val.dtype, val.shape)
-        else:
-          return val
+          return _NumPyArrayHashWrapper(val)
+        if typing.get_origin(field.type) == tuple:
+          type_args = typing.get_args(field.type)
+          if (
+              len(type_args) == 2
+              and type_args[0] == np.ndarray
+              and type_args[1] == ...
+          ):
+            return tuple(_NumPyArrayHashWrapper(v) for v in val)
+        return val
 
       def to_data(field, obj):
         return (jax.tree_util.GetAttrKey(field.name), getattr(obj, field.name))
@@ -78,10 +112,19 @@ def dataclass(clz: _T, register_as_pytree: bool) -> _T:
 
       def from_meta(field, meta):
         if field.type is np.ndarray:
-          arr = np.frombuffer(meta[0], dtype=meta[1]).reshape(meta[2])
-          return (field.name, arr)
-        else:
-          return (field.name, meta)
+          return (field.name, meta.array)
+        if typing.get_origin(field.type) == tuple:
+          type_args = typing.get_args(field.type)
+          if (
+              len(type_args) == 2
+              and type_args[0] == np.ndarray
+              and type_args[1] == ...
+          ):
+            return (
+                field.name,
+                tuple(m.array for m in meta),
+            )
+        return (field.name, meta)
 
       from_data = lambda field, meta: (field.name, meta)
 

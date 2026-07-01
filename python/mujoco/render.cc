@@ -147,7 +147,7 @@ void MjrContextWrapper::Free() {
 }  // namespace _impl
 
 namespace {
-PYBIND11_MODULE(_render, pymodule) {
+PYBIND11_MODULE(_render, pymodule, pybind11::mod_gil_not_used()) {
   namespace py = ::pybind11;
   namespace traits = python_traits;
 
@@ -157,25 +157,6 @@ PYBIND11_MODULE(_render, pymodule) {
   // Import the _structs module so that pybind11 knows about Python bindings
   // for MjWrapper types and therefore generates prettier docstrings.
   py::module::import("mujoco._structs");
-
-  py::class_<raw::MjrRect> mjrRect(pymodule, "MjrRect");
-  mjrRect.def(py::init([](int left, int bottom, int width, int height) {
-                return raw::MjrRect{left, bottom, width, height};
-              }),
-              py::arg("left"), py::arg("bottom"), py::arg("width"),
-              py::arg("height"));
-  mjrRect.def("__copy__",
-              [](const raw::MjrRect& other) { return raw::MjrRect(other); });
-  mjrRect.def("__deepcopy__", [](const raw::MjrRect& other, py::dict) {
-    return raw::MjrRect(other);
-  });
-  DefineStructFunctions(mjrRect);
-#define X(var) mjrRect.def_readwrite(#var, &raw::MjrRect::var)
-  X(left);
-  X(bottom);
-  X(width);
-  X(height);
-#undef X
 
   py::class_<MjrContextWrapper> mjrContext(pymodule, "MjrContext");
   mjrContext.def(py::init<>());

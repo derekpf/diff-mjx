@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 """Engine support functions."""
+
 from collections.abc import Iterable, Sequence
 from typing import Optional, Tuple, Union
 
@@ -60,14 +61,8 @@ def make_m(
 ) -> jax.Array:
   """Computes M = a @ b.T + diag(d)."""
 
-  ij = []
-  for i in range(m.nv):
-    j = i
-    while j > -1:
-      ij.append((i, j))
-      j = m.dof_parentid[j]
-
-  i, j = (jp.array(x) for x in zip(*ij))
+  i = np.repeat(np.arange(m.nv), m.M_rownnz)
+  j = m.M_colind
 
   if not is_sparse(m):
     qm = a @ b.T
@@ -82,29 +77,23 @@ def make_m(
   b_j = jp.take(b, j, axis=0)
   qm = jax.vmap(jp.dot)(a_i, b_j)
 
-  # add diagonal
   if d is not None:
-    qm = qm.at[m.dof_Madr].add(d)
+    diag_adr = m.M_rowadr + m.M_rownnz - 1
+    qm = qm.at[diag_adr].add(d)
 
   return qm
 
 
 def full_m(m: Model, d: Data) -> jax.Array:
-  """Reconstitute dense mass matrix from qM."""
+  """Reconstitute dense mass matrix from M."""
 
   if not is_sparse(m):
-    return d.qM
+    return d._impl.M  # pytype: disable=attribute-error
 
-  ij = []
-  for i in range(m.nv):
-    j = i
-    while j > -1:
-      ij.append((i, j))
-      j = m.dof_parentid[j]
+  i = np.repeat(np.arange(m.nv), m.M_rownnz)
+  j = m.M_colind
 
-  i, j = (jp.array(x) for x in zip(*ij))
-
-  mat = jp.zeros((m.nv, m.nv)).at[(i, j)].set(d.qM)
+  mat = jp.zeros((m.nv, m.nv)).at[(i, j)].set(d._impl.M)  # pytype: disable=attribute-error
 
   # also set upper triangular
   mat = mat + jp.tril(mat, -1).T
@@ -116,24 +105,23 @@ def mul_m(m: Model, d: Data, vec: jax.Array) -> jax.Array:
   """Multiply vector by inertia matrix."""
 
   if not is_sparse(m):
-    return d.qM @ vec
+    return d._impl.M @ vec  # pytype: disable=attribute-error
 
-  diag_mul = d.qM[jp.array(m.dof_Madr)] * vec
+  diag_adr = m.M_rowadr + m.M_rownnz - 1
+  diag_mul = d._impl.M[diag_adr] * vec  # pytype: disable=attribute-error
 
   is_, js, madr_ijs = [], [], []
   for i in range(m.nv):
-    madr_ij, j = m.dof_Madr[i], i
+    adr = m.M_rowadr[i]
+    for k in range(m.M_rownnz[i] - 1):
+      is_.append(i)
+      js.append(m.M_colind[adr + k])
+      madr_ijs.append(adr + k)
 
-    while True:
-      madr_ij, j = madr_ij + 1, m.dof_parentid[j]
-      if j == -1:
-        break
-      is_, js, madr_ijs = is_ + [i], js + [j], madr_ijs + [madr_ij]
+  i, j, madr_ij = (np.array(x, dtype=np.int32) for x in (is_, js, madr_ijs))
 
-  i, j, madr_ij = (jp.array(x, dtype=jp.int32) for x in (is_, js, madr_ijs))
-
-  out = diag_mul.at[i].add(d.qM[madr_ij] * vec[j])
-  out = out.at[j].add(d.qM[madr_ij] * vec[i])
+  out = diag_mul.at[i].add(d._impl.M[madr_ij] * vec[j])  # pytype: disable=attribute-error
+  out = out.at[j].add(d._impl.M[madr_ij] * vec[i])  # pytype: disable=attribute-error
 
   return out
 
@@ -142,15 +130,52 @@ def jac(
     m: Model, d: Data, point: jax.Array, body_id: jax.Array
 ) -> Tuple[jax.Array, jax.Array]:
   """Compute pair of (NV, 3) Jacobians of global point attached to body."""
+  # TODO(taylorhowell): statically construct mask
   fn = lambda carry, b: b if carry is None else b + carry
   mask = (jp.arange(m.nbody) == body_id) * 1
   mask = scan.body_tree(m, fn, 'b', 'b', mask, reverse=True)
   mask = mask[jp.array(m.dof_bodyid)] > 0
 
   offset = point - d.subtree_com[jp.array(m.body_rootid)[body_id]]
-  jacp = jax.vmap(lambda a, b=offset: a[3:] + jp.cross(a[:3], b))(d.cdof)
+  jacp = jax.vmap(lambda a, b=offset: a[3:] + jp.cross(a[:3], b))(d.cdof)  # pytype: disable=attribute-error
   jacp = jax.vmap(jp.multiply)(jacp, mask)
-  jacr = jax.vmap(jp.multiply)(d.cdof[:, :3], mask)
+  jacr = jax.vmap(jp.multiply)(d.cdof[:, :3], mask)  # pytype: disable=attribute-error
+
+  return jacp, jacr
+
+
+def jac_dot(
+    m: Model, d: Data, point: jax.Array, body_id: jax.Array
+) -> Tuple[jax.Array, jax.Array]:
+  """Compute pair of (NV, 3) Jacobian time derivatives of global point attached to body."""
+  # TODO(taylorhowell): statically construct mask
+  fn = lambda carry, b: b if carry is None else b + carry
+  mask = (jp.arange(m.nbody) == body_id) * 1
+  mask = scan.body_tree(m, fn, 'b', 'b', mask, reverse=True)
+  mask = mask[jp.array(m.dof_bodyid)] > 0
+
+  offset = point - d.subtree_com[jp.array(m.body_rootid)[body_id]]
+  pvel_lin = d.cvel[body_id][3:] - jp.cross(offset, d.cvel[body_id][:3])
+
+  cdof = d.cdof
+  cdof_dot = d.cdof_dot
+
+  # check for quaternion
+  jnt_type = m.jnt_type[m.dof_jntid]
+  dof_adr = m.jnt_dofadr[m.dof_jntid]
+  is_quat = (jnt_type == JointType.BALL) | (
+      jnt_type == JointType.FREE & (np.arange(m.nv) >= dof_adr + 3)
+  )
+
+  # compute cdof_dot for quaternion (use current body cvel)
+  cdof_dot_quat = jax.vmap(math.motion_cross)(d.cvel[m.dof_bodyid], cdof)
+  cdof_dot = jp.where(is_quat[:, None], cdof_dot_quat, cdof_dot)
+
+  jacp = jax.vmap(
+      lambda a, b: a[3:] + jp.cross(a[:3], offset) + jp.cross(b[:3], pvel_lin)
+  )(cdof_dot, cdof)
+  jacp = jax.vmap(jp.multiply)(jacp, mask)
+  jacr = jax.vmap(jp.multiply)(cdof_dot[:, :3], mask)  # pytype: disable=attribute-error
 
   return jacp, jacr
 
@@ -211,6 +236,7 @@ def _getnum(m: Union[Model, mujoco.MjModel], obj: mujoco._enums.mjtObj) -> int:
       mujoco.mjtObj.mjOBJ_NUMERIC: m.nnumeric,
       mujoco.mjtObj.mjOBJ_TUPLE: m.ntuple,
       mujoco.mjtObj.mjOBJ_KEY: m.nkey,
+      mujoco.mjtObj.mjOBJ_FLEX: m.nflex,
   }.get(obj, 0)
 
 
@@ -234,6 +260,7 @@ def _getadr(
       mujoco.mjtObj.mjOBJ_NUMERIC: m.name_numericadr,
       mujoco.mjtObj.mjOBJ_TUPLE: m.name_tupleadr,
       mujoco.mjtObj.mjOBJ_KEY: m.name_keyadr,
+      mujoco.mjtObj.mjOBJ_FLEX: m.name_flexadr,
   }[obj]
 
 
@@ -433,11 +460,18 @@ class BindData(object):
         return name
       else:
         raise AttributeError('ctrl is not available for this type')
-    if name == 'qpos' or name == 'qvel' or name == 'qacc':
+    if (
+        name == 'qpos'
+        or name == 'qvel'
+        or name == 'qacc'
+        or name.startswith('qfrc_')
+    ):
       if self.prefix == 'jnt_':
         return name
       else:
-        raise AttributeError('qpos, qvel, qacc are not available for this type')
+        raise AttributeError(
+            'qpos, qvel, qacc, qfrc are not available for this type'
+        )
     else:
       return self.prefix + name
 
@@ -451,7 +485,9 @@ class BindData(object):
     return var[..., idx, :]
 
   def __getattr__(self, name: str):
-    if name in ('sensordata', 'qpos', 'qvel', 'qacc'):
+    if name in ('sensordata', 'qpos', 'qvel', 'qacc') or (
+        name.startswith('qfrc_')
+    ):
       adr = num = 0
       if name == 'sensordata':
         adr = self.model.sensor_adr[self.id]
@@ -460,7 +496,7 @@ class BindData(object):
         adr = self.model.jnt_qposadr[self.id]
         typ = self.model.jnt_type[self.id]
         num = sum((typ == jt) * jt.qpos_width() for jt in JointType)
-      elif name == 'qvel' or name == 'qacc':
+      elif name == 'qvel' or name == 'qacc' or name.startswith('qfrc_'):
         adr = self.model.jnt_dofadr[self.id]
         typ = self.model.jnt_type[self.id]
         num = sum((typ == jt) * jt.dof_width() for jt in JointType)
@@ -473,6 +509,8 @@ class BindData(object):
         return self._slice(self.__getname(name), slice(adr, adr + num))
       else:
         return self._slice(self.__getname(name), adr)
+    elif name in ('mocap_pos', 'mocap_quat'):
+      return self._slice(self.__getname(name), self.model.body_mocapid[self.id])
     return self._slice(self.__getname(name), self.id)
 
   def set(self, name: str, value: jax.Array) -> Data:
@@ -485,7 +523,7 @@ class BindData(object):
       iter(value)
     except TypeError:
       value = [value]
-    if name in ('qpos', 'qvel', 'qacc'):
+    if name in ('qpos', 'qvel', 'qacc', 'mocap_pos', 'mocap_quat'):
       adr = num = 0
       if name == 'qpos':
         adr = self.model.jnt_qposadr[self.id]
@@ -495,16 +533,23 @@ class BindData(object):
         adr = self.model.jnt_dofadr[self.id]
         typ = self.model.jnt_type[self.id]
         num = sum((typ == jt) * jt.dof_width() for jt in JointType)
+      elif name == 'mocap_pos':
+        adr = self.model.body_mocapid[self.id] * 3
+        num = np.ones_like(self.id, dtype=int) * 3
+      elif name == 'mocap_quat':
+        adr = self.model.body_mocapid[self.id] * 4
+        num = np.ones_like(self.id, dtype=int) * 4
       if not isinstance(self.id, list):
         adr = [adr]
         num = [num]
     elif isinstance(self.id, list):
-      adr = self.id * dim
+      adr = (np.array(self.id) * dim).tolist()
       num = [dim for _ in range(len(self.id))]
     else:
       adr = [self.id * dim]
       num = [dim]
     i = 0
+    value = jax.numpy.array(value).flatten()
     for a, n in zip(adr, num):
       shape = array.shape
       array = array.flatten().at[a : a + n].set(value[i : i + n]).reshape(shape)
@@ -549,20 +594,20 @@ def contact_force(
     m: Model, d: Data, contact_id: int, to_world_frame: bool = False
 ) -> jax.Array:
   """Extract 6D force:torque for one contact, in contact frame by default."""
-  efc_address = d.contact.efc_address[contact_id]
-  condim = d.contact.dim[contact_id]
+  efc_address = d._impl.contact.efc_address[contact_id]  # pytype: disable=attribute-error
+  condim = d._impl.contact.dim[contact_id]  # pytype: disable=attribute-error
   if m.opt.cone == ConeType.PYRAMIDAL:
     force = _decode_pyramid(
-        d.efc_force[efc_address:], d.contact.friction[contact_id], condim
+        d._impl.efc_force[efc_address:], d._impl.contact.friction[contact_id], condim  # pytype: disable=attribute-error
     )
   elif m.opt.cone == ConeType.ELLIPTIC:
-    force = d.efc_force[efc_address : efc_address + condim]
+    force = d._impl.efc_force[efc_address : efc_address + condim]  # pytype: disable=attribute-error
     force = jp.concatenate([force, jp.zeros((6 - condim))])
   else:
     raise ValueError(f'Unknown cone type: {m.opt.cone}')
 
   if to_world_frame:
-    force = force.reshape((-1, 3)) @ d.contact.frame[contact_id]
+    force = force.reshape((-1, 3)) @ d._impl.contact.frame[contact_id]  # pytype: disable=attribute-error
     force = force.reshape(-1)
 
   return force * (efc_address >= 0)
@@ -573,21 +618,21 @@ def contact_force_dim(
 ) -> Tuple[jax.Array, np.ndarray]:
   """Extract 6D force:torque for contacts with dimension dim."""
   # valid contact and condim indices
-  idx_dim = (d.contact.efc_address >= 0) & (d.contact.dim == dim)
+  idx_dim = (d._impl.contact.efc_address >= 0) & (d._impl.contact.dim == dim)  # pytype: disable=attribute-error
 
   # contact force from efc
   if m.opt.cone == ConeType.PYRAMIDAL:
     efc_address = (
-        d.contact.efc_address[idx_dim, None]
+        d._impl.contact.efc_address[idx_dim, None]  # pytype: disable=attribute-error
         + np.arange(np.where(dim == 1, 1, 2 * (dim - 1)))[None]
     )
-    efc_force = d.efc_force[efc_address]
+    efc_force = d._impl.efc_force[efc_address]  # pytype: disable=attribute-error
     force = jax.vmap(_decode_pyramid, in_axes=(0, 0, None))(
-        efc_force, d.contact.friction[idx_dim], dim
+        efc_force, d._impl.contact.friction[idx_dim], dim  # pytype: disable=attribute-error
     )
   elif m.opt.cone == ConeType.ELLIPTIC:
-    efc_address = d.contact.efc_address[idx_dim, None] + np.arange(dim)[None]
-    force = d.efc_force[efc_address]
+    efc_address = d._impl.contact.efc_address[idx_dim, None] + np.arange(dim)[None]  # pytype: disable=attribute-error
+    force = d._impl.efc_force[efc_address]  # pytype: disable=attribute-error
     force = jp.hstack([force, jp.zeros((force.shape[0], 6 - dim))])
   else:
     raise ValueError(f'Unknown cone type: {m.opt.cone}.')
@@ -808,9 +853,7 @@ def wrap_inside(
     status0 = df > -mjMINVAL
 
     # new point
-    z_next = z - (1 - converged) * f / jp.where(
-        jp.abs(df) < mjMINVAL, mjMINVAL, df
-    )
+    z_next = z - (1 - converged) * math.safe_div(f, df)
 
     # make sure we are moving to the left; SHOULD NOT OCCUR
     status1 = z_next > z

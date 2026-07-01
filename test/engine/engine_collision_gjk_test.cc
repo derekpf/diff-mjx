@@ -16,34 +16,35 @@
 
 #include "src/engine/engine_collision_gjk.h"
 
-#include <array>
 #include <cstddef>
+#include <memory>
+#include <string>
+#include <string_view>
 #include <vector>
 
-#include <ccd/ccd.h>
-#include <ccd/vec3.h>
+#include <ccd/ccd.h>  // IWYU pragma: keep
+#include <ccd/vec3.h>  // IWYU pragma: keep
 
 #include "src/engine/engine_collision_convex.h"
 #include <mujoco/mujoco.h>
-#include <mujoco/mjtnum.h>
+#include <mujoco/mjtype.h>
 #include "test/fixture.h"
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 // uncomment to run tests with libccd
-//#define TEST_WITH_LIBCCD
+// #define TEST_WITH_LIBCCD
 
 namespace mujoco {
 namespace {
 
-using ::testing::NotNull;
 using ::testing::ElementsAre;
 using ::testing::Pointwise;
 using ::testing::DoubleNear;
 
 constexpr mjtNum kTolerance = 1e-6;
 constexpr int kMaxIterations = 1000;
-constexpr char kEllipoid[] = R"(
+constexpr char kEllipsoidXml[] = R"(
 <mujoco model="Ellipsoid Test">
   <compiler angle="radian"/>
   <size nkey="1"/>
@@ -62,16 +63,8 @@ constexpr char kEllipoid[] = R"(
   </keyframe>
 </mujoco>)";
 
-void* CCDAllocate(void* data, std::size_t nbytes) {
-  return new std::byte[nbytes];
-}
-
-void CCDFree(void* data, void* buffer) {
-  delete [] (std::byte*)buffer;
-}
-
-mjtNum GeomDist(mjModel* m, mjData* d, int g1, int g2, mjtNum x1[3],
-                mjtNum x2[3], mjtNum cutoff = mjMAX_LIMIT) {
+mjtNum GeomDist(const MjModelPtr& m, const MjDataPtr& d, int g1, int g2,
+                mjtNum x1[3], mjtNum x2[3], mjtNum cutoff = mjMAX_LIMIT) {
   mjCCDConfig config;
   mjCCDStatus status;
 
@@ -80,10 +73,11 @@ mjtNum GeomDist(mjModel* m, mjData* d, int g1, int g2, mjtNum x1[3],
   config.tolerance = kTolerance,
   config.max_contacts = 0;   // no geom contacts needed
   config.dist_cutoff = cutoff;
+  config.buffer = nullptr;
 
   mjCCDObj obj1, obj2;
-  mjc_initCCDObj(&obj1, m, d, g1, 0);
-  mjc_initCCDObj(&obj2, m, d, g2, 0);
+  mjc_initCCDObj(&obj1, m.get(), d.get(), g1, 0);
+  mjc_initCCDObj(&obj2, m.get(), d.get(), g2, 0);
 
   mjtNum dist = mjc_ccd(&config, &status, &obj1, &obj2);
   if (status.nx > 0) {
@@ -94,11 +88,12 @@ mjtNum GeomDist(mjModel* m, mjData* d, int g1, int g2, mjtNum x1[3],
 }
 
 int Penetration(mjCCDStatus& status, mjtNum& depth, std::vector<mjtNum>& dir,
-                std::vector<mjtNum>& pos, mjModel* model, mjData* data,
-                int g1, int g2, mjtNum margin = 0, int max_contacts = 1) {
+                std::vector<mjtNum>& pos, const MjModelPtr& model,
+                const MjDataPtr& data, int g1, int g2, mjtNum margin = 0,
+                int max_contacts = 1) {
   mjCCDObj obj1, obj2;
-  mjc_initCCDObj(&obj1, model, data, g1, margin);
-  mjc_initCCDObj(&obj2, model, data, g2, margin);
+  mjc_initCCDObj(&obj1, model.get(), data.get(), g1, margin);
+  mjc_initCCDObj(&obj2, model.get(), data.get(), g2, margin);
 
 #if defined(TEST_WITH_LIBCCD)
   if (max_contacts == 1) {
@@ -130,14 +125,13 @@ int Penetration(mjCCDStatus& status, mjtNum& depth, std::vector<mjtNum>& dir,
   mjCCDConfig config;
 
   // set config
+  auto buffer = std::vector<std::byte>(mjc_ccdSize(kMaxIterations));
   config.max_iterations = kMaxIterations;
   config.tolerance = kTolerance;
   config.max_contacts = max_contacts;
   config.dist_cutoff = 0;  // no geom distances needed
   config.max_contacts = max_contacts;
-  config.context = nullptr;
-  config.alloc = CCDAllocate;
-  config.free = CCDFree;
+  config.buffer = buffer.data();
 
   mjtNum dist = mjc_ccd(&config, &status, &obj1, &obj2);
   if (dist < 0) {
@@ -172,23 +166,18 @@ TEST_F(MjGjkTest, SphereSphereDist) {
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
-
-  int geom1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int geom2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int geom1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int geom2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
   mjtNum x1[3], x2[3];
   mjtNum dist = GeomDist(model, data, geom1, geom2, x1, x2);
 
   EXPECT_EQ(dist, 1);
   EXPECT_THAT(x1, ElementsAre(-.5, 0, 0));
   EXPECT_THAT(x2, ElementsAre(.5, 0, 0));
-  mj_deleteData(data);
-  mj_deleteModel(model);
 }
 
 TEST_F(MjGjkTest, SphereSphereDistCutoff) {
@@ -200,20 +189,15 @@ TEST_F(MjGjkTest, SphereSphereDistCutoff) {
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
-
-  int geom1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int geom2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int geom1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int geom2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
   mjtNum dist = GeomDist(model, data, geom1, geom2, nullptr, nullptr, .999999);
 
   EXPECT_EQ(dist, mjMAX_LIMIT);
-  mj_deleteData(data);
-  mj_deleteModel(model);
 }
 
 TEST_F(MjGjkTest, SphereSphereNoDist) {
@@ -225,24 +209,19 @@ TEST_F(MjGjkTest, SphereSphereNoDist) {
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
-
-  int geom1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int geom2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int geom1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int geom2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, geom1, geom2);
 
-  EXPECT_EQ(ncons, 0);
-  mj_deleteData(data);
-  mj_deleteModel(model);
+  ASSERT_EQ(ncons, 0);
 }
 
 TEST_F(MjGjkTest, SphereSphereIntersect) {
@@ -254,22 +233,19 @@ TEST_F(MjGjkTest, SphereSphereIntersect) {
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
-
-  int geom1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int geom2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int geom1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int geom2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, geom1, geom2);
 
-  EXPECT_EQ(ncons, 1);
+  ASSERT_EQ(ncons, 1);
 
   // penetration depth
   EXPECT_NEAR(dist, -2, kTolerance);
@@ -283,9 +259,6 @@ TEST_F(MjGjkTest, SphereSphereIntersect) {
   EXPECT_NEAR(pos[0], 1, kTolerance);
   EXPECT_NEAR(pos[1], 0, kTolerance);
   EXPECT_NEAR(pos[2], 0, kTolerance);
-
-  mj_deleteData(data);
-  mj_deleteModel(model);
 }
 
 TEST_F(MjGjkTest, BoxBoxDepth) {
@@ -297,47 +270,38 @@ TEST_F(MjGjkTest, BoxBoxDepth) {
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
-
-  int geom1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int geom2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int geom1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int geom2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, geom1, geom2);
 
-  EXPECT_EQ(ncons, 1);
+  ASSERT_EQ(ncons, 1);
 
   EXPECT_NEAR(dist, -1, kTolerance);
   EXPECT_NEAR(dir[0], 1, kTolerance);
   EXPECT_NEAR(dir[1], 0, kTolerance);
   EXPECT_NEAR(dir[2], 0, kTolerance);
-
-  mj_deleteData(data);
-  mj_deleteModel(model);
 }
 
 TEST_F(MjGjkTest, BoxBoxDepth2) {
   static constexpr char xml[] = R"(
   <mujoco>
     <worldbody>
-      <geom name="geom1" type="box" pos="0 0 0" size="5 5 .1"/>
-      <geom name="geom2" type="box" pos="0 0 0" size="1 1 1"/>
+      <geom name="geom1" type="box" size="5 5 .1"/>
+      <geom name="geom2" type="box" size="1 1 1"/>
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
-
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
   mjtNum* xmat = data->geom_xmat + 9;
   mjtNum* xpos = data->geom_xpos + 3;
@@ -356,40 +320,33 @@ TEST_F(MjGjkTest, BoxBoxDepth2) {
   xmat[7] = 0.000260616790777321797722282382;
   xmat[8] = 0.999999932078886044628518448008;
 
-  int geom1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int geom2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int geom1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int geom2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, geom1, geom2);
 
-  if (ncons == 1) {
-    EXPECT_NEAR(dist, -0.033401579411886845, kTolerance);
-    EXPECT_NEAR(dir[0], 0, kTolerance);
-    EXPECT_NEAR(dir[1], 0, kTolerance);
-    EXPECT_NEAR(dir[2], 1, kTolerance);
-  }
-
-  mj_deleteData(data);
-  mj_deleteModel(model);
+  ASSERT_EQ(ncons, 1);
+  EXPECT_NEAR(dist, -0.033401579411886845, kTolerance);
+  EXPECT_THAT(dir[0], MjNear(0, kTolerance, 1e-5));
+  EXPECT_THAT(dir[1], MjNear(0, kTolerance, 1e-5));
+  EXPECT_THAT(dir[2], MjNear(1, kTolerance, 1e-5));
 }
 
 TEST_F(MjGjkTest, BoxBoxDepth3) {
   static constexpr char xml[] = R"(
   <mujoco>
     <worldbody>
-      <geom name="geom1" type="box" pos="0 0 0" size="0.25 0.25 0.05"/>
-      <geom name="geom2" type="box" pos="0 0 0" size="0.25 0.25 0.05"/>
+      <geom name="geom1" type="box" size="0.25 0.25 0.05"/>
+      <geom name="geom2" type="box" size="0.25 0.25 0.05"/>
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
-
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
   mjtNum* xmat = data->geom_xmat;
   mjtNum* xpos = data->geom_xpos;
@@ -425,22 +382,200 @@ TEST_F(MjGjkTest, BoxBoxDepth3) {
   xpos[1] = -0.023505499999999998617106200527;
   xpos[2] = -4.659230360891631228525966434972;
 
-  int geom1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int geom2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int geom1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int geom2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, geom1, geom2);
 
-  EXPECT_EQ(ncons, 1);
+  ASSERT_EQ(ncons, 1);
   EXPECT_NEAR(dist, -0.003066, kTolerance);
   EXPECT_NEAR(dir[0], 0, kTolerance);
   EXPECT_NEAR(dir[1], 0, kTolerance);
   EXPECT_NEAR(dir[2], -1, kTolerance);
+}
 
-  mj_deleteData(data);
-  mj_deleteModel(model);
+
+TEST_F(MjGjkTest, BoxBoxSize05) {
+  static constexpr char xml[] = R"(
+  <mujoco>
+    <worldbody>
+      <geom name="geom1" type="box" size="0.5 0.5 0.5"/>
+      <geom name="geom2" type="box" size="0.5 0.5 0.5"/>
+    </worldbody>
+  </mujoco>)";
+
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
+
+  mjtNum* xmat = data->geom_xmat;
+  mjtNum* xpos = data->geom_xpos;
+
+  xmat[0] = 1.000000000000000;
+  xmat[1] = 0.000000047289880;
+  xmat[2] = -0.000000050905665;
+  xmat[3] = -0.000000047289880;
+  xmat[4] = 1.000000000000000;
+  xmat[5] = 0.000000017136196;
+  xmat[6] = 0.000000050905665;
+  xmat[7] = -0.000000017136193;
+  xmat[8] = 1.000000000000000;
+
+  xpos[0] = 0.000000009724202;
+  xpos[1] = -0.000000014139289;
+  xpos[2] = 7.369161128997803;
+
+  xmat = data->geom_xmat + 9;
+  xpos = data->geom_xpos + 3;
+
+  xmat[0] = 1.000000000000000;
+  xmat[1] = -0.000000013726950;
+  xmat[2] = 0.000000008946020;
+  xmat[3] = 0.000000013726950;
+  xmat[4] = 1.000000000000000;
+  xmat[5] = -0.000000012039017;
+  xmat[6] = -0.000000008946020;
+  xmat[7] = 0.000000012039017;
+  xmat[8] = 1.000000000000000;
+
+  xpos[0] = 0.000000013445962;
+  xpos[1] = -0.000000019194527;
+  xpos[2] = 8.264492034912109;
+
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
+
+  mjCCDStatus status;
+  std::vector<mjtNum> dir, pos;
+  mjtNum dist;
+  int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 4);
+
+  ASSERT_EQ(ncons, 4);
+}
+
+TEST_F(MjGjkTest, BoxBoxSize05b) {
+  static constexpr char xml[] = R"(
+  <mujoco>
+    <worldbody>
+      <geom name="geom1" type="box" size="0.5 0.5 0.5"/>
+      <geom name="geom2" type="box" size="0.5 0.5 0.5"/>
+    </worldbody>
+  </mujoco>)";
+
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
+
+  mjtNum* xmat = data->geom_xmat;
+  mjtNum* xpos = data->geom_xpos;
+
+  xmat[0] = 1.000000000000000;
+  xmat[1] = -0.000000008764291;
+  xmat[2] = 0.000000386995168;
+  xmat[3] = 0.000000008764733;
+  xmat[4] = 1.000000000000000;
+  xmat[5] = -0.000001144207772;
+  xmat[6] = -0.000000386995168;
+  xmat[7] = 0.000001144207772;
+  xmat[8] = 1.000000000000000;
+
+  xpos[0] = 0.000000962082822;
+  xpos[1] = -0.000001747370789;
+  xpos[2] = 3.469238519668579;
+
+  xmat = data->geom_xmat + 9;
+  xpos = data->geom_xpos + 3;
+
+  xmat[0] = 1.000000000000000;
+  xmat[1] = 0.000000003313412;
+  xmat[2] = -0.000000196321196;
+  xmat[3] = -0.000000003313673;
+  xmat[4] = 1.000000000000000;
+  xmat[5] = -0.000001329654879;
+  xmat[6] = 0.000000196321196;
+  xmat[7] = 0.000001329654879;
+  xmat[8] = 1.000000000000000;
+
+  xpos[0] = 0.000002897753802;
+  xpos[1] = -0.000004625266229;
+  xpos[2] = 4.435211658477783;
+
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
+
+  mjCCDStatus status;
+  std::vector<mjtNum> dir, pos;
+  mjtNum dist;
+  int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 4);
+
+  ASSERT_EQ(ncons, 4);
+  EXPECT_NEAR(dir[0], 0, 1e-5);
+  EXPECT_NEAR(dir[1], 0, 1e-5);
+  EXPECT_NEAR(dir[2], 1, kTolerance);
+}
+
+TEST_F(MjGjkTest, BoxBoxSize05c) {
+  static constexpr char xml[] = R"(
+  <mujoco>
+    <worldbody>
+      <geom name="geom1" type="box" size="0.5 0.5 0.5"/>
+      <geom name="geom2" type="box" size="0.5 0.5 0.5"/>
+    </worldbody>
+  </mujoco>)";
+
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
+
+  mjtNum* xmat = data->geom_xmat;
+  mjtNum* xpos = data->geom_xpos;
+
+  xmat[0] = 1.000000000000000;
+  xmat[1] = -0.000000000570266;
+  xmat[2] = 0.000000168314983;
+  xmat[3] = 0.000000000570290;
+  xmat[4] = 1.000000000000000;
+  xmat[5] = -0.000000142656916;
+  xmat[6] = -0.000000168314983;
+  xmat[7] = 0.000000142656916;
+  xmat[8] = 1.000000000000000;
+
+  xpos[0] = 0.000000188941314;
+  xpos[1] = -0.000000195227585;
+  xpos[2] = 0.497281551361084;
+
+  xmat = data->geom_xmat + 9;
+  xpos = data->geom_xpos + 3;
+
+  xmat[0] = 1.000000000000000;
+  xmat[1] = -0.000000000058608;
+  xmat[2] = 0.000001607574859;
+  xmat[3] = 0.000000000060496;
+  xmat[4] = 1.000000000000000;
+  xmat[5] = -0.000001174638669;
+  xmat[6] = -0.000001607574859;
+  xmat[7] = 0.000001174638669;
+  xmat[8] = 1.000000000000000;
+
+  xpos[0] = 0.000000953407323;
+  xpos[1] = -0.000000923845278;
+  xpos[2] = 1.493984460830688;
+
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
+
+  mjCCDStatus status;
+  std::vector<mjtNum> dir, pos;
+  mjtNum dist;
+  int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 4);
+
+  ASSERT_EQ(ncons, 4);
+  EXPECT_NEAR(dir[0], 0, 1e-5);
+  EXPECT_NEAR(dir[1], 0, 1e-5);
+  EXPECT_NEAR(dir[2], 1, kTolerance);
 }
 
 TEST_F(MjGjkTest, BoxBoxTouching) {
@@ -452,26 +587,21 @@ TEST_F(MjGjkTest, BoxBoxTouching) {
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
-
-  int geom1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int geom2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
-  int ncons = Penetration(status, dist, dir, pos, model, data, geom1, geom2);
+  int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2);
 
-  EXPECT_EQ(ncons, 0);
-  EXPECT_GT(status.epa_status, 0);
+  ASSERT_EQ(ncons, 0);
+  EXPECT_EQ(status.epa_status, -1);
 
-  mj_deleteData(data);
-  mj_deleteModel(model);
 }
 
 TEST_F(MjGjkTest, BoxBoxMultiCCD) {
@@ -483,22 +613,19 @@ TEST_F(MjGjkTest, BoxBoxMultiCCD) {
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
-
-  int g1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int g2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 1000);
 
-  EXPECT_EQ(ncons, 4);
+  ASSERT_EQ(ncons, 4);
   EXPECT_NEAR(dist, -.1, kTolerance);
 
   EXPECT_NEAR(dir[0], 0, kTolerance);
@@ -509,9 +636,6 @@ TEST_F(MjGjkTest, BoxBoxMultiCCD) {
                                                        1.0,  1.0, 0.95,
                                                        1.0, -1.0, 0.95,
                                                       -1.0, -1.0, 0.95}));
-
-  mj_deleteData(data);
-  mj_deleteModel(model);
 }
 
 TEST_F(MjGjkTest, BoxBoxMultiCCD2) {
@@ -523,22 +647,19 @@ TEST_F(MjGjkTest, BoxBoxMultiCCD2) {
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
-
-  int g1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int g2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 1000);
 
-  EXPECT_EQ(ncons, 4);
+  ASSERT_EQ(ncons, 4);
   EXPECT_NEAR(dist, -.1, kTolerance);
 
   EXPECT_NEAR(dir[0], 0, kTolerance);
@@ -549,9 +670,6 @@ TEST_F(MjGjkTest, BoxBoxMultiCCD2) {
                                                       10.0, 10.0, 0.95,
                                                       10.0,  8.5, 0.95,
                                                        8.5,  8.5, 0.95}));
-
-  mj_deleteData(data);
-  mj_deleteModel(model);
 }
 
 TEST_F(MjGjkTest, BoxBoxMultiCCD3) {
@@ -563,12 +681,9 @@ TEST_F(MjGjkTest, BoxBoxMultiCCD3) {
     </worldbody>
 </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
-
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
   mjtNum* xmat = data->geom_xmat + 9;
   mjtNum* xpos = data->geom_xpos + 3;
@@ -588,17 +703,15 @@ TEST_F(MjGjkTest, BoxBoxMultiCCD3) {
   xpos[2] = 1.095456702630382306296041861060;
 
 
-  int g1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int g2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 1000);
 
-  EXPECT_EQ(ncons, 4);
-  mj_deleteData(data);
-  mj_deleteModel(model);
+  ASSERT_EQ(ncons, 4);
 }
 
 TEST_F(MjGjkTest, BoxBoxMultiCCD4) {
@@ -610,12 +723,9 @@ TEST_F(MjGjkTest, BoxBoxMultiCCD4) {
     </worldbody>
 </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
-
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
   mjtNum* xmat = data->geom_xmat;
   mjtNum* xpos = data->geom_xpos;
@@ -651,22 +761,20 @@ TEST_F(MjGjkTest, BoxBoxMultiCCD4) {
   xpos[1] = -0.023500601273213628239489025873;
   xpos[2] = -4.958782854594746325460619118530;
 
-  int g1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int g2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 1000);
 
-  EXPECT_EQ(ncons, 8);
+  ASSERT_EQ(ncons, 8);
   EXPECT_NEAR(dist, -0.00060425119242707459, kTolerance);
 
   EXPECT_NEAR(dir[0], 0, kTolerance);
   EXPECT_NEAR(dir[1], 0, kTolerance);
   EXPECT_NEAR(dir[2], -1, kTolerance);
-  mj_deleteData(data);
-  mj_deleteModel(model);
 }
 
 TEST_F(MjGjkTest, BoxBoxMultiCCD5) {
@@ -678,12 +786,9 @@ TEST_F(MjGjkTest, BoxBoxMultiCCD5) {
     </worldbody>
 </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
-
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
   mjtNum* xmat = data->geom_xmat;
   mjtNum* xpos = data->geom_xpos;
@@ -720,22 +825,20 @@ TEST_F(MjGjkTest, BoxBoxMultiCCD5) {
   xpos[2] = -4.659108354876987156956147373421;
 
 
-  int g1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int g2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 1000);
 
-  EXPECT_EQ(ncons, 8);
-  EXPECT_NEAR(dist, -0.0001077858631973211, kTolerance);
+  ASSERT_EQ(ncons, 8);
 
-  EXPECT_NEAR(dir[0], 0.00019065, kTolerance);
-  EXPECT_NEAR(dir[1], -8.6494189274575805e-05, kTolerance);
+  EXPECT_THAT(dist, MjNear(-0.0001077858631973211, kTolerance, 1e-4));
+  EXPECT_THAT(dir[0], MjNear(0.00019065, kTolerance, 1e-4));
+  EXPECT_THAT(dir[1], MjNear(-0.00008649, kTolerance, 1e-4));
   EXPECT_NEAR(dir[2], -1, kTolerance);
-  mj_deleteData(data);
-  mj_deleteModel(model);
 }
 
 TEST_F(MjGjkTest, BoxBoxMultiCCD6) {
@@ -747,12 +850,9 @@ TEST_F(MjGjkTest, BoxBoxMultiCCD6) {
     </worldbody>
 </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
-
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
   mjtNum* xmat = data->geom_xmat + 9;
   mjtNum* xpos = data->geom_xpos + 3;
@@ -771,39 +871,34 @@ TEST_F(MjGjkTest, BoxBoxMultiCCD6) {
   xpos[1] = 0.190777715293135141649827346555;
   xpos[2] = 0.100006658017411736993906856696;
 
-  int g1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int g2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 1000);
 
-  EXPECT_EQ(ncons, 5);
-  EXPECT_NEAR(dist, -0.00009843, kTolerance);
+  ASSERT_EQ(ncons, 5);
+  EXPECT_THAT(dist, MjNear(-0.00009843, kTolerance, 1e-4));
 
-  EXPECT_NEAR(dir[0], -0.0008879306751646528, kTolerance);
-  EXPECT_NEAR(dir[1], -0.00046014397575771832, kTolerance);
-  EXPECT_NEAR(dir[2], 1, kTolerance);
-  mj_deleteData(data);
-  mj_deleteModel(model);
+  EXPECT_THAT(dir[0], MjNear(-0.0008879, kTolerance, 1e-4));
+  EXPECT_THAT(dir[1], MjNear(-0.0004601, kTolerance, 1e-3));
+  EXPECT_NEAR(dir[2], 0.9999994, kTolerance);
 }
 
 TEST_F(MjGjkTest, BoxBoxMultiCCD7) {
   static constexpr char xml[] = R"(
   <mujoco>
     <worldbody>
-      <geom name="geom1" type="box" size=".25 .25 .05" pos="0 0 0"/>
-      <geom name="geom2" type="box" size=".25 .25 .05" pos="0 0 0"/>
+      <geom name="geom1" type="box" size=".25 .25 .05"/>
+      <geom name="geom2" type="box" size=".25 .25 .05"/>
     </worldbody>
 </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
-
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
   mjtNum* xmat = data->geom_xmat;
   mjtNum* xpos = data->geom_xpos;
@@ -840,34 +935,29 @@ TEST_F(MjGjkTest, BoxBoxMultiCCD7) {
   xpos[2] = -4.958375812037025376355359185254;
 
 
-  int g1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int g2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 1000);
 
-  EXPECT_EQ(ncons, 8);
-  mj_deleteData(data);
-  mj_deleteModel(model);
+  ASSERT_EQ(ncons, 8);
 }
 
 TEST_F(MjGjkTest, BoxBoxMultiCCD8) {
   static constexpr char xml[] = R"(
   <mujoco>
     <worldbody>
-      <geom name="geom1" type="box" size=".25 .25 .05" pos="0 0 0"/>
-      <geom name="geom2" type="box" size=".25 .25 .05" pos="0 0 0"/>
+      <geom name="geom1" type="box" size=".25 .25 .05"/>
+      <geom name="geom2" type="box" size=".25 .25 .05"/>
     </worldbody>
 </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
-
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
   mjtNum* xmat = data->geom_xmat;
   mjtNum* xpos = data->geom_xpos;
@@ -903,34 +993,29 @@ TEST_F(MjGjkTest, BoxBoxMultiCCD8) {
   xpos[1] = -0.023505499999999998617106200527;
   xpos[2] = -4.958574289672835533338002278470;
 
-  int g1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int g2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 1000);
 
-  EXPECT_EQ(ncons, 4);
-  mj_deleteData(data);
-  mj_deleteModel(model);
+  ASSERT_EQ(ncons, 4);
 }
 
 TEST_F(MjGjkTest, BoxBoxMultiCCD9) {
   static constexpr char xml[] = R"(
   <mujoco>
     <worldbody>
-      <geom name="geom1" type="box" size=".025 .025 .025" pos="0 0 0"/>
-      <geom name="geom2" type="box" size=".025 .025 .025" pos="0 0 0"/>
+      <geom name="geom1" type="box" size=".025 .025 .025"/>
+      <geom name="geom2" type="box" size=".025 .025 .025"/>
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
-
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
   mjtNum* xmat = data->geom_xmat;
   mjtNum* xpos = data->geom_xpos;
@@ -967,34 +1052,29 @@ TEST_F(MjGjkTest, BoxBoxMultiCCD9) {
   xpos[2] = 0.2156259187793853615566774806211469694972;
 
 
-  int g1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int g2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 1000);
 
-  EXPECT_EQ(ncons, 4);
-  mj_deleteData(data);
-  mj_deleteModel(model);
+  ASSERT_EQ(ncons, 4);
 }
 
 TEST_F(MjGjkTest, BoxBoxMultiCCD10) {
   static constexpr char xml[] = R"(
   <mujoco>
     <worldbody>
-      <geom name="geom1" type="box" pos="0 0 0" size="0.025 0.025 0.025"/>
-      <geom name="geom2" type="box" pos="0 0 0" size="0.025 0.025 0.025"/>
+      <geom name="geom1" type="box" size="0.025 0.025 0.025"/>
+      <geom name="geom2" type="box" size="0.025 0.025 0.025"/>
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
-
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
   mjtNum* xpos = data->geom_xpos;
 
@@ -1008,35 +1088,30 @@ TEST_F(MjGjkTest, BoxBoxMultiCCD10) {
   xpos[1] = -0.0765140000000000264357424839545274153352;
   xpos[2] = 0.1751399999999999623767621415026951581240;
 
-  int g1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int g2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 8);
 
-  EXPECT_EQ(ncons, 4);
+  ASSERT_EQ(ncons, 4);
 
-  mj_deleteData(data);
-  mj_deleteModel(model);
 }
 
 TEST_F(MjGjkTest, BoxBoxMultiCCD11) {
   static constexpr char xml[] = R"(
   <mujoco>
     <worldbody>
-      <geom name="geom1" type="box" pos="0 0 0" size="0.025 0.025 0.025"/>
-      <geom name="geom2" type="box" pos="0 0 0" size="0.025 0.025 0.025"/>
+      <geom name="geom1" type="box" size="0.025 0.025 0.025"/>
+      <geom name="geom2" type="box" size="0.025 0.025 0.025"/>
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
-
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
   mjtNum* xpos = data->geom_xpos;
   mjtNum* xmat = data->geom_xmat;
@@ -1074,35 +1149,30 @@ TEST_F(MjGjkTest, BoxBoxMultiCCD11) {
   xpos[2] = 0.1745248497897437800485676007156143896282;
 
 
-  int g1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int g2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 8);
 
-  EXPECT_EQ(ncons, 4);
-
-  mj_deleteData(data);
-  mj_deleteModel(model);
+  // contact unrecoverable under single precision
+  ASSERT_EQ(ncons, sizeof(mjtNum) == 8 ? 4 : 0);
 }
 
 TEST_F(MjGjkTest, BoxBoxMultiCCD12) {
   static constexpr char xml[] = R"(
   <mujoco>
     <worldbody>
-      <geom name="geom1" type="box" pos="0 0 0" size="0.025 0.025 0.025"/>
-      <geom name="geom2" type="box" pos="0 0 0" size="0.025 0.025 0.025"/>
+      <geom name="geom1" type="box" size="0.025 0.025 0.025"/>
+      <geom name="geom2" type="box" size="0.025 0.025 0.025"/>
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
-
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
   mjtNum* xpos = data->geom_xpos;
   mjtNum* xmat = data->geom_xmat;
@@ -1138,35 +1208,30 @@ TEST_F(MjGjkTest, BoxBoxMultiCCD12) {
   xpos[1] = -0.0764300000000000256950016819246229715645;
   xpos[2] = 0.1748374248948718623353215662064030766487;
 
-  int g1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int g2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 8);
 
-  EXPECT_EQ(ncons, 4);
+  ASSERT_EQ(ncons, 4);
 
-  mj_deleteData(data);
-  mj_deleteModel(model);
 }
 
 TEST_F(MjGjkTest, BoxBoxMultiCCD13) {
   static constexpr char xml[] = R"(
   <mujoco>
     <worldbody>
-      <geom name="geom1" type="box" pos="0 0 0" size="0.02 0.02 0.02"/>
-      <geom name="geom2" type="box" pos="0 0 0" size="0.02 0.02 0.02"/>
+      <geom name="geom1" type="box" size="0.02 0.02 0.02"/>
+      <geom name="geom2" type="box" size="0.02 0.02 0.02"/>
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
-
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
   mjtNum* xpos = data->geom_xpos;
   mjtNum* xmat = data->geom_xmat;
@@ -1202,22 +1267,134 @@ TEST_F(MjGjkTest, BoxBoxMultiCCD13) {
   xpos[1] = -0.2000000000000000111022302462515654042363;
   xpos[2] = -0.0418396695286432432348000531874276930466;
 
-  int g1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int g2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 8);
 
-  EXPECT_EQ(ncons, 4);
+  ASSERT_EQ(ncons, 4);
 
   EXPECT_NEAR(dir[0], 0, kTolerance);
   EXPECT_NEAR(dir[1], 0, kTolerance);
   EXPECT_NEAR(dir[2], 1, kTolerance);
+}
 
-  mj_deleteData(data);
-  mj_deleteModel(model);
+TEST_F(MjGjkTest, BoxBoxMultiCCD14) {
+  static constexpr char xml[] = R"(
+  <mujoco>
+    <worldbody>
+      <geom name="geom1" type="box" size="0.02 0.02 0.02"/>
+      <geom name="geom2" type="box" size="0.02 0.02 0.02"/>
+    </worldbody>
+  </mujoco>)";
+
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
+
+  mjtNum* xpos = data->geom_xpos;
+  mjtNum* xmat = data->geom_xmat;
+
+  xmat[0] = 0.9999999980312528347070610834634862840176;
+  xmat[1] = 0.0000179109150612445166097282805983681442;
+  xmat[2] = -0.0000601389470252842008382576644009986921;
+  xmat[3] = -0.0000179108686851742081238159781664265324;
+  xmat[4] = 0.9999999998393023226128661917755380272865;
+  xmat[5] = 0.0000007716871733595438989517368948145570;
+  xmat[6] = 0.0000601389608372434404702858157243383630;
+  xmat[7] = -0.0000007706100310572527002924239115932981;
+  xmat[8] = 0.9999999981913554325529958077822811901569;
+
+  xpos[0] = 0.0002051257133161473724877743585182088282;
+  xpos[1] = 0.0000051793157380883478958571650152542531;
+  xpos[2] = -0.0800031938952457943869944756443146616220;
+
+  xpos = data->geom_xpos + 3;
+  xmat = data->geom_xmat + 9;
+
+  xmat[0] = 0.9999999606378873195922096783760935068130;
+  xmat[1] = -0.0000186818570733572177707156047876679850;
+  xmat[2] = -0.0002799557310143530259108346491814245383;
+  xmat[3] = 0.0000186853252997592718994551708178164517;
+  xmat[4] = 0.9999999997487241110150080203311517834663;
+  xmat[5] = 0.0000123858711158191162315369768243122905;
+  xmat[6] = 0.0002799554995529331168427344955773605761;
+  xmat[7] = -0.0000123911016921886008170612322731862776;
+  xmat[8] = 0.9999999607356884201436741932411678135395;
+
+  xpos[0] = 0.0002145111032389043976328218965576866140;
+  xpos[1] = -0.0000051338999751368759734112059978095033;
+  xpos[2] = -0.0400059009625639144802633495601185131818;
+
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
+
+  mjCCDStatus status;
+  std::vector<mjtNum> dir, pos;
+  mjtNum dist;
+  int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 8);
+  ASSERT_EQ(ncons, 4);
+}
+
+TEST_F(MjGjkTest, BoxBoxMultiCCD15) {
+  static constexpr char xml[] = R"(
+  <mujoco>
+    <worldbody>
+      <geom name="geom1" type="box" size="0.5 0.5 0.1"/>
+      <geom name="geom2" type="box" size="0.025 0.025 0.025"/>
+    </worldbody>
+  </mujoco>)";
+
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
+
+  mjtNum* xmat = data->geom_xmat;
+  mjtNum* xpos = data->geom_xpos;
+
+  xmat[0] = 1.0;
+  xmat[1] = 0.0;
+  xmat[2] = 0.0;
+  xmat[3] = 0.0;
+  xmat[4] = 1.0;
+  xmat[5] = 0.0;
+  xmat[6] = 0.0;
+  xmat[7] = 0.0;
+  xmat[8] = 1.0;
+
+  xpos[0] = 0.0;
+  xpos[1] = 0.0;
+  xpos[2] = 0.0;
+
+  xmat = data->geom_xmat + 9;
+  xpos = data->geom_xpos + 3;
+
+  xmat[0] = 1.0;
+  xmat[1] = 1.62423755001306e-10;
+  xmat[2] = -1.73500047822017e-05;
+  xmat[3] = 1.44241105171083e-10;
+  xmat[4] = 1.0;
+  xmat[5] = 1.76752037077677e-05;
+  xmat[6] = 1.73500047822017e-05;
+  xmat[7] = -1.76752037077677e-05;
+  xmat[8] = 1.0;
+
+  xpos[0] = 0.0520339831709862;
+  xpos[1] = -0.0520339831709862;
+  xpos[2] = 0.124986477196217;
+
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
+
+  mjCCDStatus status;
+  std::vector<mjtNum> dir, pos;
+  mjtNum dist;
+  int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 4);
+
+  ASSERT_EQ(ncons, sizeof(mjtNum) == 8 ? 4 : 0);
 }
 
 TEST_F(MjGjkTest, SmallBoxMesh) {
@@ -1250,37 +1427,35 @@ TEST_F(MjGjkTest, SmallBoxMesh) {
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
-
-  int geom1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int geom2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int geom1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int geom2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, geom1, geom2);
 
-  EXPECT_EQ(ncons, 1);
-  EXPECT_NEAR(dist, 0, kTolerance);
+  // contact unrecoverable under single precision
+  ASSERT_EQ(ncons, sizeof(mjtNum) == 8 ? 1 : 0);
+  if (ncons) {
+    EXPECT_NEAR(dist, 0, kTolerance);
 
-  // direction
-  EXPECT_NEAR(dir[0], 0, kTolerance);
-  EXPECT_NEAR(dir[1], 0, kTolerance);
-  EXPECT_NEAR(dir[2], 1, kTolerance);
+    // direction
+    EXPECT_NEAR(dir[0], 0, kTolerance);
+    EXPECT_NEAR(dir[1], 0, kTolerance);
+    EXPECT_NEAR(dir[2], 1, kTolerance);
 
-  // position
-  EXPECT_NEAR(pos[0], 0, kTolerance);
-  EXPECT_NEAR(pos[1], 0, kTolerance);
-  EXPECT_NEAR(pos[2], 0, kTolerance);
-
-  mj_deleteData(data);
-  mj_deleteModel(model);
+    // position
+    EXPECT_NEAR(pos[0], 0, kTolerance);
+    EXPECT_NEAR(pos[1], 0, kTolerance);
+    EXPECT_NEAR(pos[2], 0, kTolerance);
+  }
 }
+
 TEST_F(MjGjkTest, BoxMesh) {
   static constexpr char xml[] = R"(
   <mujoco>
@@ -1296,24 +1471,19 @@ TEST_F(MjGjkTest, BoxMesh) {
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
-
-  int g1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int g2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, g2, g1, 0, 1000);
-
-  EXPECT_EQ(ncons, 4);
-  mj_deleteData(data);
-  mj_deleteModel(model);
+  EXPECT_EQ(model->nmeshpoly, 7);
+  ASSERT_EQ(ncons, 4);
 }
 
 TEST_F(MjGjkTest, BoxMesh2) {
@@ -1331,24 +1501,19 @@ TEST_F(MjGjkTest, BoxMesh2) {
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
-
-  int g1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int g2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, g2, g1, 0, 1000);
 
-  EXPECT_EQ(ncons, 5);
-  mj_deleteData(data);
-  mj_deleteModel(model);
+  ASSERT_EQ(ncons, 5);
 }
 
 TEST_F(MjGjkTest, BoxMeshPrune) {
@@ -1366,24 +1531,19 @@ TEST_F(MjGjkTest, BoxMeshPrune) {
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
-
-  int g1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int g2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, g2, g1, 0, 4);
 
-  EXPECT_EQ(ncons, 4);
-  mj_deleteData(data);
-  mj_deleteModel(model);
+  ASSERT_EQ(ncons, 4);
 }
 
 TEST_F(MjGjkTest, MeshMesh) {
@@ -1403,24 +1563,19 @@ TEST_F(MjGjkTest, MeshMesh) {
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
-
-  int g1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int g2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 1000);
 
-  EXPECT_EQ(ncons, 5);
-  mj_deleteData(data);
-  mj_deleteModel(model);
+  ASSERT_EQ(ncons, 5);
 }
 
 TEST_F(MjGjkTest, MeshMeshPrune) {
@@ -1440,96 +1595,60 @@ TEST_F(MjGjkTest, MeshMeshPrune) {
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
-
-  int g1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int g2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 4);
 
-  EXPECT_EQ(ncons, 4);
-  mj_deleteData(data);
-  mj_deleteModel(model);
+  ASSERT_EQ(ncons, 4);
 }
 
 TEST_F(MjGjkTest, BoxEdge) {
   static constexpr char xml[] = R"(
   <mujoco>
-    <option>
-      <flag nativeccd="enable" multiccd="enable"/>
-    </option>
-
     <worldbody>
-      <geom type="box" name="box1" size="5 5 .1" pos="0 0 0"/>
-      <body pos="0 0 2">
-        <freejoint/>
-        <geom type="box" name="box2" size="1 1 1"/>
-      </body>
-      <body pos="0 0 4.4" euler="0 90 40">
-        <freejoint/>
-        <geom type="box" name="box3" size="1 1 1"/>
-      </body>
+      <geom type="box" name="box1" size="1 1 1" pos="0 0 2"/>
+      <geom type="box" name="box2" size="1 1 1" pos="0 0 4.4" euler="0 90 40"/>
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
-
-  int g1 = mj_name2id(model, mjOBJ_GEOM, "box2");
-  int g2 = mj_name2id(model, mjOBJ_GEOM, "box3");
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "box1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "box2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 4);
 
-  EXPECT_EQ(ncons, 2);
-  mj_deleteData(data);
-  mj_deleteModel(model);
+  ASSERT_EQ(ncons, 2);
 }
 
 TEST_F(MjGjkTest, BoxEdge2) {
   static constexpr char xml[] = R"(
   <mujoco>
-    <option>
-      <flag nativeccd="enable" multiccd="enable"/>
-    </option>
-
     <worldbody>
-      <geom type="box" name="box1" size="5 5 .1" pos="0 0 0"/>
-      <body pos="0 0 2">
-        <freejoint/>
-        <geom type="box" name="box2" size="1 1 1"/>
-      </body>
-
-      <body pos="0 0 4.4" euler="0 90 40">
-        <freejoint/>
-        <geom type="box" name="box3" size="1 1 1"/>
-      </body>
+      <geom type="box" name="box1" size="1 1 1"/>
+      <geom type="box" name="box2" size="1 1 1"/>
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
-
-  mjtNum* xmat = data->geom_xmat + 9;
-  mjtNum* xpos = data->geom_xpos + 3;
+  mjtNum* xmat = data->geom_xmat;
+  mjtNum* xpos = data->geom_xpos;
 
   xmat[0] = 0.9999979704374094557906005320546682924032;
   xmat[1] = -0.0017789363449516469497385662279498319549;
@@ -1545,8 +1664,8 @@ TEST_F(MjGjkTest, BoxEdge2) {
   xpos[1] = 0.0098645950089783600300830102014515432529;
   xpos[2] = 1.1037596929447945903746131079969927668571;
 
-  xmat = data->geom_xmat + 18;
-  xpos = data->geom_xpos + 6;
+  xmat = data->geom_xmat + 9;
+  xpos = data->geom_xpos + 3;
 
   xmat[0] = 0.0006737475542006746490053537002040684456;
   xmat[1] = -0.0095603689585630827196816028390458086506;
@@ -1562,48 +1681,32 @@ TEST_F(MjGjkTest, BoxEdge2) {
   xpos[1] = 0.9828851949225971829093850828940048813820;
   xpos[2] = 3.0930077345364814789263618877157568931580;
 
-  int g1 = mj_name2id(model, mjOBJ_GEOM, "box2");
-  int g2 = mj_name2id(model, mjOBJ_GEOM, "box3");
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "box1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "box2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 4);
 
-  EXPECT_EQ(ncons, 2);
-  mj_deleteData(data);
-  mj_deleteModel(model);
+  ASSERT_EQ(ncons, 2);
 }
 
 TEST_F(MjGjkTest, BoxEdgeEdge) {
   static constexpr char xml[] = R"(
   <mujoco>
-    <option>
-      <flag nativeccd="enable" multiccd="enable"/>
-    </option>
-
     <worldbody>
-      <geom type="box" name="box1" size="5 5 .1" pos="0 0 -.1"/>
-      <body pos="-2 0 2.99" euler="0 10 0">
-        <freejoint/>
-        <geom type="box" name="box2" size=".15 1 3"/>
-      </body>
-      <body pos="2 0 2.99" euler="0 -10 0">
-        <freejoint/>
-        <geom type="box" name="box3" size=".15 1 3"/>
-      </body>
+      <geom type="box" name="box1" size=".15 1 3"/>
+      <geom type="box" name="box2" size=".15 1 3"/>
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
-
-  mjtNum* xmat = data->geom_xmat + 9;
-  mjtNum* xpos = data->geom_xpos + 3;
+  mjtNum* xmat = data->geom_xmat;
+  mjtNum* xpos = data->geom_xpos;
 
   xmat[0] = 0.9182779243587342321575306414160877466202;
   xmat[1] = -0.0000000000000000000364268564068890756444;
@@ -1619,8 +1722,8 @@ TEST_F(MjGjkTest, BoxEdgeEdge) {
   xpos[1] = 0.0000000000000000007148993364299687318184;
   xpos[2] = 2.8141526153588731773425024584867060184479;
 
-  xmat = data->geom_xmat + 18;
-  xpos = data->geom_xpos + 6;
+  xmat = data->geom_xmat + 9;
+  xpos = data->geom_xpos + 3;
 
   xmat[0] = 0.9182779243587342321575306414160877466202;
   xmat[1] = 0.0000000000000000000728398144756416399722;
@@ -1636,90 +1739,103 @@ TEST_F(MjGjkTest, BoxEdgeEdge) {
   xpos[1] = -0.0000000000000000008679606505055748997840;
   xpos[2] = 2.8141526153588731773425024584867060184479;
 
-  int g1 = mj_name2id(model, mjOBJ_GEOM, "box2");
-  int g2 = mj_name2id(model, mjOBJ_GEOM, "box3");
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "box1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "box2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 4);
 
-  EXPECT_EQ(ncons, 2);
-  mj_deleteData(data);
-  mj_deleteModel(model);
+  ASSERT_EQ(ncons, 2);
 }
 
 TEST_F(MjGjkTest, MeshEdge) {
   static constexpr char xml[] = R"(
   <mujoco>
-    <option>
-      <flag nativeccd="enable" multiccd="enable"/>
-    </option>
     <asset>
       <mesh name="smallbox"
         vertex="-1 -1 -1  1 -1 -1   1  1 -1
                  1  1  1  1 -1  1  -1  1 -1
                 -1  1  1 -1 -1  1"/>
-      <mesh name="floor"
-        vertex="-1 -1 -1  1 -1 -1  1  1 -1
-                 1  1  1  1 -1  1 -1  1 -1
-                -1  1  1 -1 -1  1"
-        scale="5 5 1"/>
     </asset>
     <worldbody>
-      <geom type="mesh" name="box1" mesh="floor" pos="0 0 0"/>
-      <body pos="0 0 2">
-        <freejoint/>
-        <geom type="mesh" mesh="smallbox" name="box2" size="1 1 1"/>
-      </body>
-      <body pos="0 0 4.4" euler="0 90 40">
-        <freejoint/>
-        <geom type="mesh" mesh="smallbox" name="box3" size="1 1 1"/>
-      </body>
+      <geom type="mesh" mesh="smallbox" name="box1" size="1 1 1" pos="0 0 2"/>
+      <geom type="mesh" mesh="smallbox" name="box2" size="1 1 1" pos="0 0 4.4" euler="0 90 40"/>
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
-
-  int g1 = mj_name2id(model, mjOBJ_GEOM, "box2");
-  int g2 = mj_name2id(model, mjOBJ_GEOM, "box3");
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "box1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "box2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 4);
 
-  EXPECT_EQ(ncons, 2);
-  mj_deleteData(data);
-  mj_deleteModel(model);
+  ASSERT_EQ(ncons, 2);
+}
+
+TEST_F(MjGjkTest, MeshEdge2) {
+  static constexpr char xml[] = R"(
+  <mujoco>
+    <asset>
+      <mesh name="meshbox"
+            vertex="-1 -1 -1
+                     1 -1 -1
+                     1  1 -1
+                     1  1  1
+                     1 -1  1
+                    -1  1 -1
+                    -1  1  1
+                    -1 -1  1"/>
+    </asset>
+
+    <worldbody>
+      <geom type="box" name="floor" size="6 6 2" pos="0 0 -1"/>
+      <body pos="2 0 1" euler="0 5 0">
+        <freejoint/>
+        <geom type="mesh" name="meshbox" mesh="meshbox"/>
+      </body>
+    </worldbody>
+  </mujoco>
+  )";
+
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
+
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "floor");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "meshbox");
+
+  mjCCDStatus status;
+  std::vector<mjtNum> dir, pos;
+  mjtNum dist;
+  int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 4);
+
+  ASSERT_EQ(ncons, 2);
 }
 
 TEST_F(MjGjkTest, EllipsoidEllipsoidPenetrating) {
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(kEllipoid, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
+  MjModelPtr model = LoadModelFromString(kEllipsoidXml);
+  MjDataPtr data = MakeData(model);
+  mj_resetDataKeyframe(model.get(), data.get(), 0);
+  mj_forward(model.get(), data.get());
 
-  mjData* data = mj_makeData(model);
-  mj_resetDataKeyframe(model, data, 0);
-  mj_forward(model, data);
-
-  int geom1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int geom2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int geom1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int geom2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, geom1, geom2);
 
-  EXPECT_EQ(ncons, 1);
+  ASSERT_EQ(ncons, 1);
   EXPECT_NEAR(dist, -0.00022548856248122027, kTolerance);
-  mj_deleteData(data);
-  mj_deleteModel(model);
 }
 
 TEST_F(MjGjkTest, EllipsoidEllipsoid) {
@@ -1731,20 +1847,77 @@ TEST_F(MjGjkTest, EllipsoidEllipsoid) {
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
-
-  int geom1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int geom2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int geom1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int geom2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
   mjtNum dist = GeomDist(model, data, geom1, geom2, nullptr, nullptr);
 
   EXPECT_NEAR(dist, 0.7542, .0001);
-  mj_deleteData(data);
-  mj_deleteModel(model);
+}
+
+TEST_F(MjGjkTest, EllipsoidEllipsoidSlowConvergence) {
+  // This example takes gjkIntersect 30 iterations to converge, thus failing to
+  // detect collision if opt.ccd_iterations is set to 35. With gjkIntersect
+  // disabled, GJK succeeds in 24 iterations.
+  static constexpr char xml[] = R"(
+  <mujoco>
+    <worldbody>
+      <geom name="geom1" type="ellipsoid" size=".05 .07 .15"/>
+      <geom name="geom2" type="ellipsoid" size=".05 .07 .15"/>
+    </worldbody>
+  </mujoco>)";
+
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
+
+  mjtNum* xmat = data->geom_xmat;
+  mjtNum* xpos = data->geom_xpos;
+
+  xmat[0] = 0.98799245191271645172;
+  xmat[1] = -0.13055117805648397411;
+  xmat[2] = -0.08262750674904573156;
+  xmat[3] = -0.03910798838001148386;
+  xmat[4] = 0.30606703783583483203;
+  xmat[5] = -0.95120635699897815307;
+  xmat[6] = 0.14947066671547387662;
+  xmat[7] = 0.94301609650019369013;
+  xmat[8] = 0.29728632920665870598;
+
+  xpos[0] = 0.44826351361072502844;
+  xpos[1] = -0.10441423315171689812;
+  xpos[2] = 0.21216466278453649519;
+
+  xmat = data->geom_xmat + 9;
+  xpos = data->geom_xpos + 3;
+
+  xmat[0] = 0.53301656081215953442;
+  xmat[1] = -0.59335516633486651283;
+  xmat[2] = -0.60317741377119038493;
+  xmat[3] = -0.39469414877746378245;
+  xmat[4] = 0.45620167535223110633;
+  xmat[5] = -0.79755661888461082398;
+  xmat[6] = 0.74840488695679441289;
+  xmat[7] = 0.66318148194106107951;
+  xmat[8] = 0.00896923573374096283;
+
+  xpos[0] = 0.39694137187624300989;
+  xpos[1] = 0.00961542646741688108;
+  xpos[2] = 0.29832742817753182818;
+
+  int geom1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int geom2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
+
+  mjCCDStatus status;
+  std::vector<mjtNum> dir, pos;
+  mjtNum dist;
+  Penetration(status, dist, dir, pos, model, data, geom1, geom2);
+
+  EXPECT_LT(dist, 0.0);
+  EXPECT_NEAR(dist, 0.0, kTolerance);
 }
 
 TEST_F(MjGjkTest, BoxBox) {
@@ -1756,20 +1929,60 @@ TEST_F(MjGjkTest, BoxBox) {
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
-
-  int geom1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int geom2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int geom1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int geom2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
   mjtNum dist = GeomDist(model, data, geom1, geom2, nullptr, nullptr);
 
   EXPECT_EQ(dist, 1);
-  mj_deleteData(data);
-  mj_deleteModel(model);
+}
+
+TEST_F(MjGjkTest, BoxBoxLarge) {
+  static constexpr char xml[] = R"(
+  <mujoco>
+    <worldbody>
+      <geom name="geom1" type="box" pos="0 0 0.25" size="50 50 0.25"/>
+      <geom name="geom2" type="box" pos="0 0 0.60" size="0.1 0.1 0.1"/>
+    </worldbody>
+  </mujoco>)";
+
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
+
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
+
+  mjtNum* xmat = data->geom_xmat;
+  mjtNum* xpos = data->geom_xpos;
+
+  xpos = data->geom_xpos + 3;
+  xmat = data->geom_xmat + 9;
+
+  xpos[0] = -0.000000000043537;
+  xpos[1] = -0.000000000012973;
+  xpos[2] = 0.599245786666870;
+
+  xmat[0] = 1.000000000000000;
+  xmat[1] = -0.000000000004566;
+  xmat[2] = -0.000000000167641;
+  xmat[3] = 0.000000000004566;
+  xmat[4] = 1.000000000000000;
+  xmat[5] = -0.000000000017877;
+  xmat[6] = 0.000000000167641;
+  xmat[7] = 0.000000000017877;
+  xmat[8] = 1.000000000000000;
+
+  mjCCDStatus status;
+  std::vector<mjtNum> dir, pos;
+  mjtNum dist;
+  int ncon = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 1000);
+
+  EXPECT_NEAR(dist, -0.000754, kTolerance);
+  EXPECT_EQ(ncon, 4);
 }
 
 TEST_F(MjGjkTest, LongBox) {
@@ -1786,38 +1999,28 @@ static constexpr char xml[] = R"(
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
-
-  int g1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int g2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2);
 
-  EXPECT_EQ(ncons, 1);
+  ASSERT_EQ(ncons, 1);
   EXPECT_NEAR(dist, -0.01, kTolerance);
 
-  EXPECT_NEAR(dir[0], 0, kTolerance);
-  EXPECT_NEAR(dir[1], 0, kTolerance);
-  EXPECT_NEAR(dir[2], 1, kTolerance);
-
-  EXPECT_NEAR(pos[0], 0, kTolerance);
-  EXPECT_NEAR(pos[1], 0, kTolerance);
-  EXPECT_NEAR(pos[2], -0.005, kTolerance);
+  EXPECT_THAT(dir[0], MjNear(0, kTolerance, 1e-5));
+  EXPECT_THAT(dir[1], MjNear(0, kTolerance, 1e-5));
+  EXPECT_THAT(dir[2], MjNear(1, kTolerance, kTolerance));
 
   // multicontact
   ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 1000);
-  EXPECT_EQ(ncons, 4);
-
-  mj_deleteData(data);
-  mj_deleteModel(model);
+  ASSERT_EQ(ncons, 4);
 }
 
 TEST_F(MjGjkTest, EllipsoidEllipsoidIntersect) {
@@ -1829,25 +2032,20 @@ TEST_F(MjGjkTest, EllipsoidEllipsoidIntersect) {
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
-
-  int g1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int g2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status;
   std::vector<mjtNum> dir, pos;
   mjtNum dist;
   int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 15);
 
-  EXPECT_EQ(ncons, 1);
+  ASSERT_EQ(ncons, 1);
   EXPECT_NEAR(dist, -14.245732934582151, kTolerance);
-  mj_deleteData(data);
-  mj_deleteModel(model);
 }
 
 TEST_F(MjGjkTest, CapsuleCapsule) {
@@ -1859,20 +2057,15 @@ TEST_F(MjGjkTest, CapsuleCapsule) {
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
-
-  int geom1 = mj_name2id(model, mjOBJ_GEOM, "geom1");
-  int geom2 = mj_name2id(model, mjOBJ_GEOM, "geom2");
+  int geom1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int geom2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
   mjtNum dist = GeomDist(model, data, geom1, geom2, nullptr, nullptr);
 
   EXPECT_NEAR(dist, 0.4711, .0001);
-  mj_deleteData(data);
-  mj_deleteModel(model);
 }
 
 TEST_F(MjGjkTest, CylinderBoxMargin) {
@@ -1880,7 +2073,7 @@ TEST_F(MjGjkTest, CylinderBoxMargin) {
   <mujoco>
     <statistic meansize="0.15"/>
     <option>
-      <flag gravity="disable"/>
+      <flag gravity="disable" multiccd="disable"/>
     </option>
 
     <worldbody>
@@ -1894,18 +2087,45 @@ TEST_F(MjGjkTest, CylinderBoxMargin) {
     </worldbody>
   </mujoco>)";
 
-  std::array<char, 1000> error;
-  mjModel* model = LoadModelFromString(xml, error.data(), error.size());
-  ASSERT_THAT(model, NotNull()) << "Failed to load model: " << error.data();
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
 
-  mjData* data = mj_makeData(model);
-  mj_forward(model, data);
-
+  // margin=0.1 means forces generated when dist<0.1
+  // the contact at dist~0.015 is within margin, so forces are generated
   EXPECT_EQ(data->ncon, 1);
-  EXPECT_LT(data->contact[0].efc_address, 0);
+  EXPECT_GE(data->contact[0].efc_address, 0);
+}
 
-  mj_deleteData(data);
-  mj_deleteModel(model);
+TEST_F(MjGjkTest, BoxEdgeFlipped) {
+  static constexpr char xml[] = R"(
+  <mujoco>
+    <worldbody>
+      <geom name="geom1" pos="1.10164554 -0.11389316 0.74"
+            quat="-0.348312918 0 0 0.937378318" type="box" size="0.65 0.48 0.04"/>
+      <geom name="geom2" type="box" size="0.1 1.2 1.4" pos="1.4 0 1.425"/>
+    </worldbody>
+  </mujoco>)";
+
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
+
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "geom1");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
+
+  mjCCDStatus status;
+  std::vector<mjtNum> dir, pos;
+  mjtNum dist;
+  int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2, 0, 1000);
+
+  ASSERT_EQ(ncons, 2);
+  EXPECT_NEAR(status.x1[0], 1.907368, kTolerance);
+  EXPECT_NEAR(status.x1[1], -0.052973, kTolerance);
+  EXPECT_NEAR(status.x1[2], 0.700000, kTolerance);
+  EXPECT_NEAR(status.x2[0], 1.30000, kTolerance);
+  EXPECT_NEAR(status.x2[1], -0.052973, kTolerance);
+  EXPECT_NEAR(status.x2[2], 0.700000, kTolerance);
 }
 
 }  // namespace

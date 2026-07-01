@@ -34,14 +34,18 @@ from mujoco.mjx._src import support
 # pylint: disable=g-importing-member
 from mujoco.mjx._src.types import BiasType
 from mujoco.mjx._src.types import Data
+from mujoco.mjx._src.types import DataJAX
 from mujoco.mjx._src.types import DisableBit
 from mujoco.mjx._src.types import DynType
 from mujoco.mjx._src.types import GainType
+from mujoco.mjx._src.types import Impl
 from mujoco.mjx._src.types import IntegratorType
 from mujoco.mjx._src.types import JointType
 from mujoco.mjx._src.types import Model
+from mujoco.mjx._src.types import ModelJAX
 from mujoco.mjx._src.types import TrnType
 # pylint: enable=g-importing-member
+import mujoco.mjx.warp as mjxw
 import numpy as np
 
 # RK4 tableau
@@ -72,6 +76,7 @@ def fwd_position(m: Model, d: Data, soft: bool) -> Data:
   d = smooth.camlight(m, d)
   d = smooth.tendon(m, d)
   d = smooth.crb(m, d)
+  d = smooth.tendon_armature(m, d)
   d = smooth.factor_m(m, d)
   d = collision_driver.collision(m, d)
   d = constraint.make_constraint(m, d, soft=soft)
@@ -82,19 +87,25 @@ def fwd_position(m: Model, d: Data, soft: bool) -> Data:
 @named_scope
 def fwd_velocity(m: Model, d: Data) -> Data:
   """Velocity-dependent computations."""
-  d = d.replace(
-      actuator_velocity=d.actuator_moment @ d.qvel,
-      ten_velocity=d.ten_J @ d.qvel,
-  )
+  if not isinstance(m._impl, ModelJAX) or not isinstance(d._impl, DataJAX):
+    raise ValueError('fwd_velocity requires JAX backend implementation.')
+
+  d = d.tree_replace({
+      '_impl.actuator_velocity': d._impl.actuator_moment @ d.qvel,
+      '_impl.ten_velocity': d._impl.ten_J @ d.qvel,
+  })
   d = smooth.com_vel(m, d)
   d = passive.passive(m, d)
   d = smooth.rne(m, d)
+  d = smooth.tendon_bias(m, d)
   return d
 
 
 @named_scope
 def fwd_actuation(m: Model, d: Data) -> Data:
   """Actuation-dependent computations."""
+  if not isinstance(d._impl, DataJAX):
+    raise ValueError('fwd_actuation requires JAX backend implementation.')
   if not m.nu or m.opt.disableflags & DisableBit.ACTUATION:
     return d.replace(
         act_dot=jp.zeros((m.na,)),
@@ -175,7 +186,7 @@ def fwd_actuation(m: Model, d: Data) -> Data:
       m.actuator_biastype,
       m.actuator_biasprm,
       d.actuator_length,
-      d.actuator_velocity,
+      d._impl.actuator_velocity,
       ctrl_act,
       jp.array(m.actuator_lengthrange),
       jp.array(m.actuator_acc0),
@@ -216,7 +227,7 @@ def fwd_actuation(m: Model, d: Data) -> Data:
   )
   force = jp.clip(force, forcerange[:, 0], forcerange[:, 1])
 
-  qfrc_actuator = d.actuator_moment.T @ force
+  qfrc_actuator = d._impl.actuator_moment.T @ force
 
   if m.ngravcomp:
     # actuator-level gravity compensation, skip if added as passive force
@@ -291,7 +302,7 @@ def _next_activation(m: Model, d: Data, act_dot: jax.Array) -> jax.Array:
 
   def fn(dyntype, dynprm, act, act_dot, actrange):
     if dyntype == DynType.FILTEREXACT:
-      tau = jp.clip(dynprm[0], a_min=mujoco.mjMINVAL)
+      tau = jp.clip(dynprm[0], min=mujoco.mjMINVAL)
       act = act + act_dot * tau * (1 - jp.exp(-m.opt.timestep / tau))
     else:
       act = act + act_dot * m.opt.timestep
@@ -326,19 +337,27 @@ def _advance(
   # advance time
   time = d.time + m.opt.timestep
 
+  # save qacc for next step warmstart
+  d = d.replace(qacc_warmstart=d.qacc)
+
   return d.replace(act=act, qpos=qpos, time=time)
 
 
 @named_scope
 def euler(m: Model, d: Data) -> Data:
   """Euler integrator, semi-implicit in velocity."""
+  if not isinstance(m._impl, ModelJAX) or not isinstance(d._impl, DataJAX):
+    raise ValueError('euler requires JAX backend implementation.')
+
   # integrate damping implicitly
   qacc = d.qacc
   if not m.opt.disableflags & DisableBit.EULERDAMP:
     if support.is_sparse(m):
-      dh = d.replace(qM=d.qM.at[m.dof_Madr].add(m.opt.timestep * m.dof_damping))
+      diag_adr = m.M_rowadr + m.M_rownnz - 1
+      M = d._impl.M.at[diag_adr].add(m.opt.timestep * m.dof_damping)
     else:
-      dh = d.replace(qM=d.qM + jp.diag(m.opt.timestep * m.dof_damping))
+      M = d._impl.M + jp.diag(m.opt.timestep * m.dof_damping)
+    dh = d.tree_replace({'_impl.M': M})
     dh = smooth.factor_m(m, dh)
     qfrc = d.qfrc_smooth + d.qfrc_constraint
     qacc = smooth.solve_m(m, dh, qfrc)
@@ -393,13 +412,15 @@ def rungekutta4(m: Model, d: Data) -> Data:
 @named_scope
 def implicit(m: Model, d: Data) -> Data:
   """Integrates fully implicit in velocity."""
+  if not isinstance(m._impl, ModelJAX) or not isinstance(d._impl, DataJAX):
+    raise ValueError('implicit requires JAX backend implementation.')
 
   qderiv = derivative.deriv_smooth_vel(m, d)
 
   qacc = d.qacc
   if qderiv is not None:
     # TODO(robotics-simulation): use smooth.factor_m / solve_m here:
-    qm = support.full_m(m, d) if support.is_sparse(m) else d.qM
+    qm = support.full_m(m, d) if support.is_sparse(m) else d._impl.M
     qm -= m.opt.timestep * qderiv
     qh, _ = jax.scipy.linalg.cho_factor(qm)
     qfrc = d.qfrc_smooth + d.qfrc_constraint
@@ -411,19 +432,26 @@ def implicit(m: Model, d: Data) -> Data:
 @named_scope
 def _forward(m: Model, d: Data, soft: bool) -> Data:
   """Forward dynamics."""
+  if m.impl == Impl.WARP and d.impl == Impl.WARP and mjxw.WARP_INSTALLED:
+    from mujoco.mjx.warp import forward as mjxw_forward  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+    return mjxw_forward.forward(m, d)
+
+  if not isinstance(m._impl, ModelJAX) or not isinstance(d._impl, DataJAX):
+    raise ValueError('forward requires JAX backend implementation.')
+
   d = fwd_position(m, d, soft=soft)
   d = sensor.sensor_pos(m, d)
   d = fwd_velocity(m, d)
   d = sensor.sensor_vel(m, d)
   d = fwd_actuation(m, d)
   d = fwd_acceleration(m, d)
-  d = sensor.sensor_acc(m, d)
 
-  if d.efc_J.size == 0:
+  if d._impl.efc_J.size == 0:
     d = d.replace(qacc=d.qacc_smooth)
     return d
 
   d = named_scope(solver.solve)(m, d)
+  d = sensor.sensor_acc(m, d)
 
   return d
 
@@ -442,6 +470,10 @@ def forward(m: Model, d: Data) -> Data:
 @named_scope
 def step(m: Model, d: Data) -> Data:
   """Advance simulation."""
+  if m.impl == Impl.WARP and d.impl == Impl.WARP and mjxw.WARP_INSTALLED:
+    from mujoco.mjx.warp import forward as mjxw_forward  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+    return mjxw_forward.step(m, d)
+
   d = forward(m, d)
 
   if m.opt.integrator == IntegratorType.EULER:

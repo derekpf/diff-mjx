@@ -18,6 +18,7 @@
 
 #include <string>
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <mujoco/mjmodel.h>
 #include <mujoco/mujoco.h>
@@ -26,6 +27,7 @@
 namespace mujoco {
 namespace {
 
+using ::testing::NotNull;
 using InverseTest = MujocoTest;
 
 const int kSteps = 70;
@@ -34,22 +36,51 @@ static const char* const kModelPath = "testdata/model.xml";
 // test standard continuous-time inverse dynamics
 TEST_F(InverseTest, ForwardInverseMatch) {
   const std::string xml_path = GetTestDataFilePath(kModelPath);
-  mjModel* model = mj_loadXML(xml_path.c_str(), nullptr, nullptr, 0);
+  char error[1024];
+  mjModel* model = mj_loadXML(xml_path.c_str(), nullptr, error, sizeof(error));
+  ASSERT_THAT(model, NotNull()) << error;
   mjData* data = mj_makeData(model);
 
-  // simulate, call mj_forward
-  for (int i = 0; i < kSteps; ++i) {
-    mj_step(model, data);
+  // set small tolerance and enough iterations for all solvers to converge
+  model->opt.iterations = 500;
+  model->opt.tolerance = 0;
+
+  // solver names for diagnostics
+  const char* solver_name[] = {"PGS", "CG", "Newton"};
+
+  for (int diagexact = 0; diagexact < 2; diagexact++) {
+    if (diagexact) {
+      model->opt.enableflags |= mjENBL_DIAGEXACT;
+    } else {
+      model->opt.enableflags &= ~mjENBL_DIAGEXACT;
+    }
+
+    for (mjtSolver solver : {mjSOL_PGS, mjSOL_CG, mjSOL_NEWTON}) {
+      model->opt.solver = solver;
+      mj_resetData(model, data);
+
+      // simulate, call mj_forward
+      for (int i = 0; i < kSteps; ++i) {
+        mj_step(model, data);
+      }
+      mj_forward(model, data);
+
+      // call built-in testing function
+      mj_compareFwdInv(model, data);
+
+      // per-solver tolerances
+      mjtNum epsilon;
+      switch (solver) {
+      case mjSOL_PGS:    epsilon = MjTol(1e-6, 1e-2);   break;
+      case mjSOL_CG:     epsilon = MjTol(1e-9, 1e-1);   break;
+      case mjSOL_NEWTON: epsilon = MjTol(1e-10, 1e-2);  break;
+      }
+      EXPECT_LT(data->solver_fwdinv[0], epsilon)
+        << solver_name[solver] << " diagexact=" << diagexact;
+      EXPECT_LT(data->solver_fwdinv[1], epsilon)
+        << solver_name[solver] << " diagexact=" << diagexact;
+    }
   }
-  mj_forward(model, data);
-
-  // call built-in testing function
-  mj_compareFwdInv(model, data);
-
-  // expect mismatch to be small
-  mjtNum epsilon = 1e-10;
-  EXPECT_LT(data->solver_fwdinv[0], epsilon);
-  EXPECT_LT(data->solver_fwdinv[1], epsilon);
 
   mj_deleteData(data);
   mj_deleteModel(model);
@@ -59,7 +90,9 @@ TEST_F(InverseTest, ForwardInverseMatch) {
 TEST_F(InverseTest, DiscreteInverseMatch) {
   // load and allocate
   const std::string xml_path = GetTestDataFilePath(kModelPath);
-  mjModel* model = mj_loadXML(xml_path.c_str(), nullptr, nullptr, 0);
+  char error[1024];
+  mjModel* model = mj_loadXML(xml_path.c_str(), nullptr, error, sizeof(error));
+  ASSERT_THAT(model, NotNull()) << error;
   int nv = model->nv;
   mjData* data = mj_makeData(model);
   int nstate = mj_stateSize(model, mjSTATE_INTEGRATION);
@@ -67,9 +100,16 @@ TEST_F(InverseTest, DiscreteInverseMatch) {
   mjtNum* qvel_next = (mjtNum*)mju_malloc(nv * sizeof(mjtNum));
   mjtNum* qacc_fd = (mjtNum*)mju_malloc(nv * sizeof(mjtNum));
 
-  for (auto integrator : {mjINT_EULER, mjINT_IMPLICIT, mjINT_IMPLICITFAST}) {
+  for (auto integrator : {mjINT_EULER, mjINT_IMPLICIT}) {
     model->opt.integrator = integrator;
     for (bool invdiscrete : {false, true}) {
+      // set/unset mjENBL_INVDISCRETE flag (affects both forward and inverse)
+      if (invdiscrete) {
+        model->opt.enableflags |= mjENBL_INVDISCRETE;
+      } else {
+        model->opt.enableflags &= ~mjENBL_INVDISCRETE;
+      }
+
       // simulate
       mj_resetData(model, data);
       for (int i = 0; i < kSteps; ++i) {
@@ -92,19 +132,11 @@ TEST_F(InverseTest, DiscreteInverseMatch) {
       mj_forward(model, data);
       mju_copy(data->qacc, qacc_fd, nv);
 
-      // set/unset mjENBL_INVDISCRETE flag
-      if (invdiscrete) {
-        model->opt.enableflags |= mjENBL_INVDISCRETE;
-      } else {
-        model->opt.enableflags &= ~mjENBL_INVDISCRETE;
-      }
-
       // call built-in testing function
       mj_compareFwdInv(model, data);
 
-      // depending on mjENBL_INVDISCRETE flag, expect mismatch to be small/large
       if (invdiscrete) {
-        mjtNum epsilon = 1e-9;
+        mjtNum epsilon = MjTol(1e-9, 0.05);
         EXPECT_LT(data->solver_fwdinv[0], epsilon);
         EXPECT_LT(data->solver_fwdinv[1], epsilon);
       } else {

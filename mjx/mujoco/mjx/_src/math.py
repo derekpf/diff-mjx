@@ -18,7 +18,15 @@ from typing import Optional, Tuple, Union
 
 import jax
 from jax import numpy as jp
+import mujoco
 import softjax as sj
+
+
+def safe_div(
+    num: Union[float, jax.Array], den: Union[float, jax.Array]
+) -> Union[float, jax.Array]:
+  """Safe division for case where denominator is zero."""
+  return num / (den + mujoco.mjMINVAL * (den == 0))
 
 
 def matmul_unroll(a: jax.Array, b: jax.Array) -> jax.Array:

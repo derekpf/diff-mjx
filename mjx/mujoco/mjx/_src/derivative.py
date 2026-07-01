@@ -21,14 +21,24 @@ from jax import numpy as jp
 # pylint: disable=g-importing-member
 from mujoco.mjx._src.types import BiasType
 from mujoco.mjx._src.types import Data
+from mujoco.mjx._src.types import DataJAX
 from mujoco.mjx._src.types import DisableBit
 from mujoco.mjx._src.types import DynType
 from mujoco.mjx._src.types import GainType
 from mujoco.mjx._src.types import Model
+from mujoco.mjx._src.types import ModelJAX
+from mujoco.mjx._src.types import OptionJAX
+# pylint: enable=g-importing-member
 
 
 def deriv_smooth_vel(m: Model, d: Data) -> Optional[jax.Array]:
-  """Analytical derivative of smooth forces w.r.t velocities."""
+  """Analytical derivative of smooth forces w.r.t. velocities."""
+  if (
+      not isinstance(m._impl, ModelJAX)
+      or not isinstance(d._impl, DataJAX)
+      or not isinstance(m.opt._impl, OptionJAX)
+  ):
+    raise ValueError('deriv_smooth_vel requires JAX MJX implementation.')
 
   qderiv = None
 
@@ -40,18 +50,22 @@ def deriv_smooth_vel(m: Model, d: Data) -> Optional[jax.Array]:
     gain_vel = m.actuator_gainprm[:, 2] * affine_gain
     ctrl = d.ctrl.at[m.actuator_dyntype != DynType.NONE].set(d.act)
     vel = bias_vel + gain_vel * ctrl
-    qderiv = d.actuator_moment.T @ jax.vmap(jp.multiply)(d.actuator_moment, vel)
+    qderiv = d._impl.actuator_moment.T @ jax.vmap(jp.multiply)(
+        d._impl.actuator_moment, vel
+    )
 
   # qDeriv += d qfrc_passive / d qvel
-  if not m.opt.disableflags & DisableBit.PASSIVE:
+  if not m.opt.disableflags & DisableBit.DAMPER:
     if qderiv is None:
       qderiv = -jp.diag(m.dof_damping)
     else:
       qderiv -= jp.diag(m.dof_damping)
     if m.ntendon:
-      qderiv -= d.ten_J.T @ jp.diag(m.tendon_damping) @ d.ten_J
+      qderiv -= d._impl.ten_J.T @ jp.diag(m.tendon_damping) @ d._impl.ten_J
+
+  if not m.opt.disableflags & (DisableBit.DAMPER | DisableBit.SPRING):
     # TODO(robotics-simulation): fluid drag model
-    if m.opt.has_fluid_params:
+    if m.opt._impl.has_fluid_params:  # pytype: disable=attribute-error
       raise NotImplementedError('fluid drag not supported for implicitfast')
 
   # TODO(team): rne derivative

@@ -33,6 +33,12 @@
   #include <strings.h>
 #endif
 
+// Environment variable handling.
+#ifdef _WIN32
+  #define setenv(name, value, overwrite) _putenv_s(name, value)
+  #define unsetenv(name) _putenv_s(name, "")
+#endif
+
 // Switch-case fallthrough annotation.
 #if defined(__cplusplus)
   #define mjFALLTHROUGH [[fallthrough]]
@@ -56,6 +62,27 @@
 #else
   #define mjLIKELY(x) (x)
   #define mjUNLIKELY(x) (x)
+#endif
+
+// Define ADDRESS_SANITIZER if implied by other macros.
+#if !defined(ADDRESS_SANITIZER)
+  #if defined(__SANITIZE_ADDRESS__)
+    #define ADDRESS_SANITIZER
+  #elif defined(__has_feature)
+    #if __has_feature(address_sanitizer)
+      #define ADDRESS_SANITIZER
+    #endif
+  #endif
+#endif
+
+// Atomics helper for size_t.
+#if defined(_MSC_VER) && !defined(__clang__)
+  #include <intrin.h>
+  #define mj_atomic_add_size_t(ptr, val) \
+      (size_t)_InterlockedExchangeAdd64((__int64 volatile*)(ptr), (__int64)(val))
+#else
+  #define mj_atomic_add_size_t(ptr, val) \
+      __atomic_fetch_add(ptr, val, __ATOMIC_RELAXED)
 #endif
 
 #ifdef __cplusplus

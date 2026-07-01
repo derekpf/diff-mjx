@@ -44,6 +44,8 @@ typedef enum _mjtDof {
   mjFCOMPDOF_FULL = 0,
   mjFCOMPDOF_RADIAL,
   mjFCOMPDOF_TRILINEAR,
+  mjFCOMPDOF_QUADRATIC,
+  mjFCOMPDOF_2D,
 
   mjNFCOMPDOFS
 } mjtDof;
@@ -52,13 +54,15 @@ typedef enum _mjtDof {
 class mjCFlexcomp {
  public:
   mjCFlexcomp(void);
-  bool Make(mjsBody* body, char* error, int error_sz);
+  bool Make(mjsBody* body, char* error, int error_sz, const mjVFS* vfs = nullptr);
 
   bool MakeGrid(char* error, int error_sz);
-  bool MakeBox(char* error, int error_sz);
+  bool MakeBox(char* error, int error_sz, int dim, bool open = true);
   bool MakeSquare(char* error, int error_sz);
-  bool MakeMesh(mjCModel* model, char* error, int error_sz);
-  bool MakeGMSH(mjCModel* model, char* error, int error_sz);
+  bool MakeMesh(mjCModel* model, mjsCompiler* compiler, char* error, int error_sz,
+                const mjVFS* vfs = nullptr);
+  bool MakeGMSH(mjCModel* model, mjsCompiler* compiler, char* error, int error_sz,
+                const mjVFS* vfs = nullptr);
   void LoadGMSH(mjCModel* model, mjResource* resource);
   void LoadGMSH41(char* buffer, int binary, int nodeend, int nodebegin,
                   int elemend, int elembegin);
@@ -75,12 +79,13 @@ class mjCFlexcomp {
   std::string name;               // flex name
   mjtFcompType type;              // flexcomp type
   int count[3];                   // grid count in each dimension
+  int cellcount[3];               // number of cells for interpolation
   double spacing[3];              // spacing between grid elements
   double scale[3];                // scaling for mesh and direct
   double origin[3];               // origin for generating a 3D mesh from a convex 2D mesh
   double mass;                    // total mass of auto-generated bodies
   double inertiabox;              // size of inertia box for each body
-  bool equality;                  // create edge equality constraint
+  int equality;                   // create equality constraint, 0:none, 1:edge, 2:vert, 3:strain
   std::string file;               // mesh/gmsh file name
   mjtDof doftype;                 // dof type, all vertices or trilinear interpolation
 
@@ -112,6 +117,11 @@ class mjCFlexcomp {
   std::string plugin_name;
   std::string plugin_instance_name;
   mjsPlugin plugin;
+
+ private:
+  // identify empty cells and pin nodes exclusively in empty cells
+  void MarkEmptyCells(mjCFlex* flex, const double* points, int npnt,
+                      const double minmax[6], int nx, int ny, int nz);
 };
 
 #endif  // MUJOCO_SRC_USER_USER_FLEXCOMP_H_

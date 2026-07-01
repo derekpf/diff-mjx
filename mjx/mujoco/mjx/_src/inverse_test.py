@@ -15,7 +15,6 @@
 """Tests for inverse dynamics functions."""
 from absl.testing import absltest
 from absl.testing import parameterized
-import jax
 from jax import numpy as jp
 import mujoco
 from mujoco import mjx
@@ -111,20 +110,40 @@ class InverseTest(parameterized.TestCase):
     self.assertLess(fwdinv1, 1.0e-3)
     _assert_eq(dxinv.qacc, dx.qacc, 'qacc')
 
-  def test_tendon_force_clamp(self):
-    m = test_util.load_test_file('actuator/tendon_force_clamp.xml')
+  def test_inverse_tendon_armature(self):
+    m = test_util.load_test_file('tendon/armature.xml')
+
     d = mujoco.MjData(m)
+    d.qvel = np.random.uniform(low=-0.01, high=0.01, size=d.qvel.shape)
+    d.ctrl = np.random.uniform(low=-0.01, high=0.01, size=d.ctrl.shape)
+    d.qfrc_applied = np.random.uniform(
+        low=-0.01, high=0.01, size=d.qfrc_applied.shape
+    )
+    d.xfrc_applied = np.random.uniform(
+        low=-0.01, high=0.01, size=d.xfrc_applied.shape
+    )
+    mujoco.mj_step(m, d, 10)
+
     mx = mjx.put_model(m)
     dx = mjx.put_data(m, d)
 
-    dx = dx.replace(ctrl=jp.array([1.0, 1.0, 1.0, -1.0, 1.0, -20.0, 5.0, -5.0]))
     dx = mjx.forward(mx, dx)
+    dxinv = mjx.inverse(mx, dx)
 
-    _assert_eq(
-        dx.actuator_force,
-        jp.array([1.0, 1.0, 1.0, -1.0, 1.0, -10.0, 5.0, -5.0]),
-        'actuator_force',
+    fwdinv0 = jp.linalg.norm(
+        dxinv.qfrc_constraint - dx.qfrc_constraint, ord=np.inf
     )
+    fwdinv1 = jp.linalg.norm(
+        dxinv.qfrc_inverse
+        - (
+            dx.qfrc_applied + dx.qfrc_actuator + support.xfrc_accumulate(mx, dx)
+        ),
+        ord=np.inf,
+    )
+
+    self.assertLess(fwdinv0, 1.0e-3)
+    self.assertLess(fwdinv1, 1.0e-3)
+    _assert_eq(dxinv.qacc, dx.qacc, 'qacc')
 
 
 if __name__ == '__main__':

@@ -15,10 +15,14 @@
 # Global compilation settings
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_C_EXTENSIONS OFF)
+if(EMSCRIPTEN)
+  set(CMAKE_C_EXTENSIONS ON)
+else()
+  set(CMAKE_C_EXTENSIONS OFF)
+endif()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON) # For LLVM tooling
 
 if(NOT CMAKE_CONFIGURATION_TYPES)
@@ -104,7 +108,12 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR (CMAKE_CXX_COMPILER_ID MATCHES "Clang
   endif()
 endif()
 
-if(NOT CMAKE_INTERPROCEDURAL_OPTIMIZATION AND (CMAKE_BUILD_TYPE AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug"))
+# Enable interprocedural optimization (LTO) by default for non-Debug builds, but
+# only when the caller has not made an explicit choice. Checking the value (rather
+# than whether it is DEFINED) meant an explicit `-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF`
+# was silently overridden back to ON, e.g. in CI where LTO is disabled to cut
+# build time.
+if(NOT DEFINED CMAKE_INTERPROCEDURAL_OPTIMIZATION AND (CMAKE_BUILD_TYPE AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug"))
   set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
 endif()
 
