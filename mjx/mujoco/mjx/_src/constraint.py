@@ -59,9 +59,13 @@ def _kbi(
     solref: jax.Array,
     solimp: jax.Array,
     _dmax: jax.Array,
-    pos: jax.Array,
+    pos: Optional[jax.Array] = None,
 ) -> Tuple[jax.Array, jax.Array, jax.Array]:
   """Calculates stiffness, damping, and impedance of a constraint."""
+  if pos is None:
+    pos = _dmax
+    _dmax = solimp[1]
+
   timeconst, dampratio = solref
 
   if not m.opt.disableflags & DisableBit.REFSAFE:
@@ -729,7 +733,7 @@ def make_efc_address(
 
   return address
 
-def make_constraint(m: Model, d: Data, soft: bool) -> Data:
+def make_constraint(m: Model, d: Data, soft: bool = False) -> Data:
   """Creates constraint jacobians and other supporting data."""
 
   if m.opt.disableflags & DisableBit.CONSTRAINT:
@@ -771,7 +775,7 @@ def make_constraint(m: Model, d: Data, soft: bool) -> Data:
   def fn(efc):
     k, b, imp = _kbi(m, efc.solref, efc.solimp, efc._dmax, efc.pos_imp)
     r = jp.maximum(efc.invweight * (1 - imp) / imp, mujoco.mjMINVAL)
-    pos_aref = -jax.nn.relu(-efc.pos_aref)
+    pos_aref = -jax.nn.relu(-efc.pos_aref) if soft else efc.pos_aref
     aref = -b * (efc.J @ d.qvel) - k * imp * pos_aref
     return aref, r, efc.pos_aref + efc.margin, efc.margin, efc.frictionloss
 

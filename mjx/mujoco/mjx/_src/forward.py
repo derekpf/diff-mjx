@@ -68,7 +68,7 @@ def named_scope(fn, name: str = ''):
 
 
 @named_scope
-def fwd_position(m: Model, d: Data, soft: bool) -> Data:
+def fwd_position(m: Model, d: Data, soft: bool = False) -> Data:
   """Position-dependent computations."""
   # TODO(robotics-simulation): tendon
   d = smooth.kinematics(m, d)

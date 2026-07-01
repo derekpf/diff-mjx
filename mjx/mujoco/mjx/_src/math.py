@@ -415,8 +415,6 @@ def closest_segment_to_segment_points_soft(
   best_b = sj.where(cond, best_b, new_b)
 
   return best_a, best_b
-
-
 def closest_segment_point(
     a: jax.Array, b: jax.Array, pt: jax.Array
 ) -> jax.Array:
@@ -482,5 +480,3 @@ def closest_segment_to_segment_points(
   best_b = jp.where(d1 < d2, best_b, new_b)
 
   return best_a, best_b
-
-
