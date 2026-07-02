@@ -474,6 +474,19 @@ def _efc_limit_tendon(m: Model, d: Data, soft: bool) -> Optional[_Efc]:
   )
 
 
+def _contact_piecewise(
+    m: Model, pos_aref: jax.Array, solimp: jax.Array, soft: bool
+) -> Tuple[jax.Array, jax.Array]:
+  """Applies optional piecewise contact impedance outside contact margin."""
+  if soft and m.opt.pw_solimp is not None:
+    pw_solimp = jp.array(m.opt.pw_solimp)
+    pos_imp = jp.where(pos_aref < 0, pos_aref, pos_aref - pw_solimp[2])
+    solimp = jp.where(pos_aref < 0, solimp, pw_solimp)
+    return pos_imp, solimp
+
+  return pos_aref, solimp
+
+
 def _efc_contact_frictionless(m: Model, d: Data, soft: bool) -> Optional[_Efc]:
   """Calculates constraint rows for frictionless contacts."""
   if not isinstance(m._impl, ModelJAX) or not isinstance(d._impl, DataJAX):
@@ -489,13 +502,7 @@ def _efc_contact_frictionless(m: Model, d: Data, soft: bool) -> Optional[_Efc]:
   @jax.vmap
   def rows(c: Contact):
     pos_aref = c.dist - c.includemargin
-
-    if soft:
-      pos_imp = jp.where(pos_aref < 0, pos_aref, pos_aref - m.opt.cfd_solimp[2])
-      solimp = jp.where(pos_aref < 0, c.solimp, jp.array(m.opt.cfd_solimp))
-    else:
-      pos_imp = pos_aref
-      solimp = c.solimp
+    pos_imp, solimp = _contact_piecewise(m, pos_aref, c.solimp, soft)
     active = pos_imp < 0
 
     body1, body2 = jp.array(m.geom_bodyid)[c.geom]
@@ -540,13 +547,7 @@ def _efc_contact_pyramidal(m: Model, d: Data, condim: int, soft: bool) -> Option
   @jax.vmap
   def rows(c: Contact):
     pos_aref = c.dist - c.includemargin
-
-    if soft:
-      pos_imp = jp.where(pos_aref < 0, pos_aref, pos_aref - m.opt.cfd_solimp[2])
-      solimp = jp.where(pos_aref < 0, c.solimp, jp.array(m.opt.cfd_solimp))
-    else:
-      pos_imp = pos_aref
-      solimp = c.solimp
+    pos_imp, solimp = _contact_piecewise(m, pos_aref, c.solimp, soft)
     active = pos_imp < 0
 
     body1, body2 = jp.array(m.geom_bodyid)[c.geom]
@@ -602,13 +603,7 @@ def _efc_contact_elliptic(m: Model, d: Data, condim: int, soft: bool) -> Optiona
   @jax.vmap
   def rows(c: Contact):
     pos_aref = c.dist - c.includemargin
-
-    if soft:
-      pos_imp = jp.where(pos_aref < 0, pos_aref, pos_aref - m.opt.cfd_solimp[2])
-      solimp = jp.where(pos_aref < 0, c.solimp, jp.array(m.opt.cfd_solimp))
-    else:
-      pos_imp = pos_aref
-      solimp = c.solimp
+    pos_imp, solimp = _contact_piecewise(m, pos_aref, c.solimp, soft)
     active = pos_imp < 0
 
     obj1id, obj2id = jp.array(m.geom_bodyid)[c.geom]

@@ -85,7 +85,7 @@ def inv_constraint(m: Model, d: Data) -> Data:
 def inverse(m: Model, d: Data) -> Data:
   """Inverse dynamics."""
 
-  d = forward.fwd_position(m, d, soft=m.opt.cfd_enable)
+  d = forward.fwd_position(m, d, soft=m.opt.pw_solimp is not None)
   d = sensor.sensor_pos(m, d)
   d = forward.fwd_velocity(m, d)
   d = sensor.sensor_vel(m, d)

@@ -253,10 +253,9 @@ def _put_option(
   fields['jacobian'] = types.JacobianType(o.jacobian)
   fields['col_soft_enable'] = bool(getattr(o, 'col_soft_enable', False))
   fields['softjax_mode'] = getattr(o, 'softjax_mode', 'hard')
-  fields['cfd_enable'] = bool(getattr(o, 'cfd_enable', False))
-  fields['cfd_solimp'] = jp.array(
-      getattr(o, 'cfd_solimp', np.array([0.9, 0.95, 0.001, 0.5, 2.0]))
-  )
+  fields['st_enable'] = bool(getattr(o, 'st_enable', False))
+  pw_solimp = getattr(o, 'pw_solimp', None)
+  fields['pw_solimp'] = None if pw_solimp is None else jp.array(pw_solimp)
   fields['scan_loop'] = bool(getattr(o, 'scan_loop', True))
 
   option_obj = {

@@ -14,9 +14,8 @@
 # ==============================================================================
 """Base types used in MJX."""
 
-import dataclasses
 import enum
-from typing import Any, Tuple, Union
+from typing import Any, Optional, Tuple, Union
 import warnings
 
 import jax
@@ -512,8 +511,8 @@ class Option(PyTreeNode):
   timestep: jax.Array
   col_soft_enable: bool
   softjax_mode: str
-  cfd_enable: bool
-  cfd_solimp: jax.Array
+  st_enable: bool
+  pw_solimp: Optional[jax.Array]
   scan_loop: bool
   _impl: Union[OptionJAX, mjxw_types.OptionWarp]
 

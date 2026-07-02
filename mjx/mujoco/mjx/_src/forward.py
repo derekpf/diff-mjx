@@ -458,12 +458,21 @@ def _forward(m: Model, d: Data, soft: bool) -> Data:
 
 @named_scope
 def forward(m: Model, d: Data) -> Data:
-  if m.opt.cfd_enable:
+  pw_enabled = m.opt.pw_solimp is not None
+  if pw_enabled and m.opt.st_enable:
     d_soft = _forward(m, d, soft=True)
     d_hard = _forward(m, d, soft=False)
-    d = jax.tree.map(lambda x_hard, x_soft: jax.lax.stop_gradient(x_hard) + x_soft - jax.lax.stop_gradient(x_soft), d_hard, d_soft)
+    d = jax.tree.map(
+        lambda x_hard, x_soft: (
+            jax.lax.stop_gradient(x_hard)
+            + x_soft
+            - jax.lax.stop_gradient(x_soft)
+        ),
+        d_hard,
+        d_soft,
+    )
   else:
-    d = _forward(m, d, soft=False)
+    d = _forward(m, d, soft=pw_enabled)
   return d
 
 

@@ -16,6 +16,7 @@
 
 from absl.testing import absltest
 from absl.testing import parameterized
+import jax
 from jax import numpy as jp
 import mujoco
 from mujoco import mjx
@@ -172,6 +173,33 @@ class ConstraintTest(parameterized.TestCase):
     order = test_util.efc_order(m, d, dx)
     _assert_eq(d.efc_pos, dx._impl.efc_pos[order][: d.nefc], 'efc_pos')
     _assert_eq(d.efc_margin, dx._impl.efc_margin[order][: d.nefc], 'efc_margin')
+
+  def test_contact_piecewise(self):
+    m = mujoco.MjModel.from_xml_string('<mujoco/>')
+    mx = mjx.put_model(m)
+    solimp = jp.array([0.1, 0.2, 0.3, 0.4, 0.5])
+    pos_aref = jp.array([-0.1, 0.0, 0.0005, 0.002])
+
+    pos_imp, out_solimp = jax.vmap(
+        lambda pos: constraint._contact_piecewise(mx, pos, solimp, soft=True)
+    )(pos_aref)
+    np.testing.assert_allclose(pos_imp, pos_aref)
+    np.testing.assert_allclose(out_solimp, np.tile(solimp, (4, 1)))
+
+    pw_solimp = jp.array([0.9, 0.95, 0.001, 0.5, 2.0])
+    mx = mx.replace(opt=mx.opt.replace(pw_solimp=pw_solimp))
+    pos_imp, out_solimp = jax.vmap(
+        lambda pos: constraint._contact_piecewise(mx, pos, solimp, soft=True)
+    )(pos_aref)
+    np.testing.assert_allclose(pos_imp, [-0.1, -0.001, -0.0005, 0.001])
+    np.testing.assert_allclose(out_solimp[0], solimp)
+    np.testing.assert_allclose(out_solimp[1:], np.tile(pw_solimp, (3, 1)))
+
+    pos_imp, out_solimp = jax.vmap(
+        lambda pos: constraint._contact_piecewise(mx, pos, solimp, soft=False)
+    )(pos_aref)
+    np.testing.assert_allclose(pos_imp, pos_aref)
+    np.testing.assert_allclose(out_solimp, np.tile(solimp, (4, 1)))
 
 
 if __name__ == '__main__':

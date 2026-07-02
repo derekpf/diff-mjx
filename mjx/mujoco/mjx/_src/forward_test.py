@@ -14,12 +14,16 @@
 # ==============================================================================
 """Tests for forward functions."""
 
+import types as pytypes
+from unittest import mock
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 from jax import numpy as jp
 import mujoco
 from mujoco import mjx
+from mujoco.mjx._src import forward
 from mujoco.mjx._src import test_util
 import numpy as np
 
@@ -40,6 +44,48 @@ def _assert_attr_eq(a, b, attr, tol=_TOLERANCE):
 
 
 class ForwardTest(absltest.TestCase):
+
+  def test_forward_piecewise_and_straight_through_dispatch(self):
+    d = jp.array(0.0)
+
+    with mock.patch.object(
+        forward, '_forward', side_effect=lambda m, d, soft: jp.array(soft)
+    ) as fwd:
+      m = pytypes.SimpleNamespace(
+          opt=pytypes.SimpleNamespace(pw_solimp=None, st_enable=True)
+      )
+      out = forward.forward(m, d)
+      self.assertFalse(bool(out))
+      self.assertEqual(
+          [call.kwargs['soft'] for call in fwd.call_args_list], [False]
+      )
+
+    pw_solimp = jp.array([0.9, 0.95, 0.001, 0.5, 2.0])
+    with mock.patch.object(
+        forward, '_forward', side_effect=lambda m, d, soft: jp.array(soft)
+    ) as fwd:
+      m = pytypes.SimpleNamespace(
+          opt=pytypes.SimpleNamespace(pw_solimp=pw_solimp, st_enable=False)
+      )
+      out = forward.forward(m, d)
+      self.assertTrue(bool(out))
+      self.assertEqual(
+          [call.kwargs['soft'] for call in fwd.call_args_list], [True]
+      )
+
+    with mock.patch.object(
+        forward,
+        '_forward',
+        side_effect=lambda m, d, soft: jp.array(1.0 if soft else 2.0),
+    ) as fwd:
+      m = pytypes.SimpleNamespace(
+          opt=pytypes.SimpleNamespace(pw_solimp=pw_solimp, st_enable=True)
+      )
+      out = forward.forward(m, d)
+      self.assertEqual(float(out), 2.0)
+      self.assertEqual(
+          [call.kwargs['soft'] for call in fwd.call_args_list], [True, False]
+      )
 
   def test_forward(self):
     m = test_util.load_test_file('constraints.xml')
