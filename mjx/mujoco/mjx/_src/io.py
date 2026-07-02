@@ -257,7 +257,7 @@ def _put_option(
   fields['cfd_solimp'] = jp.array(
       getattr(o, 'cfd_solimp', np.array([0.9, 0.95, 0.001, 0.5, 2.0]))
   )
-  fields['scan_loop'] = bool(getattr(o, 'scan_loop', False))
+  fields['scan_loop'] = bool(getattr(o, 'scan_loop', True))
 
   option_obj = {
       types.Impl.JAX: types.OptionJAX,
