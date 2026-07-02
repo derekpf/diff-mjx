@@ -15,7 +15,7 @@
 """Convex collisions."""
 
 import functools
-from typing import Callable, Tuple, Union
+from typing import Callable, Optional, Tuple, Union
 
 import jax
 from jax import numpy as jp
@@ -72,7 +72,10 @@ def collider(ncon: int):
           infos[i] = hfield_info.replace(pos=infos[i].pos, mat=infos[i].mat)
           in_axes[i] = hfield_info.replace(pos=0, mat=0, data=None)
           fn = functools.partial(fn, subgrid_size=key.subgrid_size)
-      fn = functools.partial(fn, soft=m.opt.col_soft_enable, softjax_mode=m.opt.softjax_mode)
+      softjax_mode = m.opt.softjax_mode
+      fn = functools.partial(
+          fn, soft=softjax_mode is not None, softjax_mode=softjax_mode
+      )
       dist, pos, frame = jax.vmap(fn, in_axes=in_axes)(*infos)  # pytype: disable=wrong-keyword-args
       if ncon > 1:
         return jax.tree_util.tree_map(jp.concatenate, (dist, pos, frame))
@@ -178,11 +181,13 @@ def _manifold_points_soft(poly: jax.Array,
     return jp.stack([a_idx, b_idx, c_idx, d_idx])
 
 @collider(ncon=4)
-def plane_convex(plane: GeomInfo,
-                 convex: ConvexInfo,
-                 soft: bool,
-                 softjax_mode: str,
-                 softness: float = 1e-6) -> Collision:
+def plane_convex(
+    plane: GeomInfo,
+    convex: ConvexInfo,
+    soft: bool,
+    softjax_mode: Optional[str],
+    softness: float = 1e-6,
+) -> Collision:
   """Calculates contacts between a plane and a convex object."""
   vert = convex.vert
 
@@ -283,7 +288,12 @@ def _sphere_convex(sphere: GeomInfo, convex: ConvexInfo) -> Collision:
 
 
 @collider(ncon=1)
-def sphere_convex(sphere: GeomInfo, convex: ConvexInfo, soft: bool, softjax_mode: str) -> Collision:
+def sphere_convex(
+    sphere: GeomInfo,
+    convex: ConvexInfo,
+    soft: bool,
+    softjax_mode: Optional[str],
+) -> Collision:
   """Calculates contact between a sphere and a convex mesh."""
   dist, pos, n = _sphere_convex(sphere, convex)
   return dist, pos, math.make_frame(n)
@@ -415,7 +425,12 @@ def _capsule_convex(cap: GeomInfo, convex: ConvexInfo) -> Collision:
 
 
 @collider(ncon=2)
-def capsule_convex(cap: GeomInfo, convex: ConvexInfo, soft: bool, softjax_mode: str) -> Collision:
+def capsule_convex(
+    cap: GeomInfo,
+    convex: ConvexInfo,
+    soft: bool,
+    softjax_mode: Optional[str],
+) -> Collision:
   """Calculates contacts between a capsule and a convex object."""
   dist, pos, n = _capsule_convex(cap, convex)
   frame = jax.vmap(math.make_frame)(n)
@@ -991,7 +1006,12 @@ def _convex_convex(c1: ConvexInfo, c2: ConvexInfo) -> Collision:
 
 
 @collider(ncon=4)
-def box_box(b1: ConvexInfo, b2: ConvexInfo, soft: bool, softjax_mode: str) -> Collision:
+def box_box(
+    b1: ConvexInfo,
+    b2: ConvexInfo,
+    soft: bool,
+    softjax_mode: Optional[str],
+) -> Collision:
   """Calculates contacts between two boxes."""
   if soft:
     raise NotImplementedError("Soft box-box collision not implemented")
@@ -1001,7 +1021,12 @@ def box_box(b1: ConvexInfo, b2: ConvexInfo, soft: bool, softjax_mode: str) -> Co
 
 
 @collider(ncon=4)
-def convex_convex(c1: ConvexInfo, c2: ConvexInfo, soft: bool, softjax_mode: str) -> Collision:
+def convex_convex(
+    c1: ConvexInfo,
+    c2: ConvexInfo,
+    soft: bool,
+    softjax_mode: Optional[str],
+) -> Collision:
   """Calculates contacts between two convex objects."""
   if soft:
     raise NotImplementedError("Soft convex-convex collision not implemented")
@@ -1109,7 +1134,11 @@ def _hfield_collision(
 
 @collider(ncon=4)
 def hfield_sphere(
-    h: HFieldInfo, s: GeomInfo, subgrid_size: Tuple[int, int], soft: bool, softjax_mode: str
+    h: HFieldInfo,
+    s: GeomInfo,
+    subgrid_size: Tuple[int, int],
+    soft: bool,
+    softjax_mode: Optional[str],
 ) -> Collision:
   """Calculates contacts between a hfield and a sphere."""
   if soft:
@@ -1135,7 +1164,11 @@ def hfield_sphere(
 
 @collider(ncon=4)
 def hfield_capsule(
-    h: HFieldInfo, c: GeomInfo, subgrid_size: Tuple[int, int], soft: bool, softjax_mode: str
+    h: HFieldInfo,
+    c: GeomInfo,
+    subgrid_size: Tuple[int, int],
+    soft: bool,
+    softjax_mode: Optional[str],
 ) -> Collision:
   """Calculates contacts between a hfield and a capsule."""
   if soft:
@@ -1161,7 +1194,11 @@ def hfield_capsule(
 
 @collider(ncon=4)
 def hfield_convex(
-    h: HFieldInfo, c: ConvexInfo, subgrid_size: Tuple[int, int], soft: bool, softjax_mode: str
+    h: HFieldInfo,
+    c: ConvexInfo,
+    subgrid_size: Tuple[int, int],
+    soft: bool,
+    softjax_mode: Optional[str],
 ) -> Collision:
   """Calculates contacts between a hfield and a capsule."""
   if soft:

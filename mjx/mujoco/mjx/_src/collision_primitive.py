@@ -14,7 +14,7 @@
 # ==============================================================================
 """Collision primitives."""
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import jax
 from jax import numpy as jp
@@ -37,7 +37,10 @@ def collider(ncon: int):
       g1, g2 = geom.T
       info1 = GeomInfo(d.geom_xpos[g1], d.geom_xmat[g1], m.geom_size[g1])
       info2 = GeomInfo(d.geom_xpos[g2], d.geom_xmat[g2], m.geom_size[g2])
-      fn = functools.partial(func, soft=m.opt.col_soft_enable, softjax_mode=m.opt.softjax_mode)
+      softjax_mode = m.opt.softjax_mode
+      fn = functools.partial(
+          func, soft=softjax_mode is not None, softjax_mode=softjax_mode
+      )
       dist, pos, frame = jax.vmap(fn)(info1, info2)
       if ncon > 1:
         return jax.tree_util.tree_map(jp.concatenate, (dist, pos, frame))
@@ -62,7 +65,12 @@ def _plane_sphere(
 
 
 @collider(ncon=1)
-def plane_sphere(plane: GeomInfo, sphere: GeomInfo, soft: bool, softjax_mode: str) -> Collision:
+def plane_sphere(
+    plane: GeomInfo,
+    sphere: GeomInfo,
+    soft: bool,
+    softjax_mode: Optional[str],
+) -> Collision:
   """Calculates contact between a plane and a sphere."""
   n = plane.mat[:, 2]
   dist, pos = _plane_sphere(n, plane.pos, sphere.pos, sphere.size[0])
@@ -72,7 +80,12 @@ def plane_sphere(plane: GeomInfo, sphere: GeomInfo, soft: bool, softjax_mode: st
 
 
 @collider(ncon=2)
-def plane_capsule(plane: GeomInfo, cap: GeomInfo, soft: bool, softjax_mode: str) -> Collision:
+def plane_capsule(
+    plane: GeomInfo,
+    cap: GeomInfo,
+    soft: bool,
+    softjax_mode: Optional[str],
+) -> Collision:
   """Calculates two contacts between a capsule and a plane."""
   n, axis = plane.mat[:, 2], cap.mat[:, 2]
   # align contact frames with capsule axis
@@ -100,7 +113,12 @@ def plane_capsule(plane: GeomInfo, cap: GeomInfo, soft: bool, softjax_mode: str)
 
 
 @collider(ncon=1)
-def plane_ellipsoid(plane: GeomInfo, ellipsoid: GeomInfo, soft: bool, softjax_mode: str) -> Collision:
+def plane_ellipsoid(
+    plane: GeomInfo,
+    ellipsoid: GeomInfo,
+    soft: bool,
+    softjax_mode: Optional[str],
+) -> Collision:
   """Calculates one contact between an ellipsoid and a plane."""
   n = plane.mat[:, 2]
   size = ellipsoid.size
@@ -118,7 +136,12 @@ def plane_ellipsoid(plane: GeomInfo, ellipsoid: GeomInfo, soft: bool, softjax_mo
 
 
 @collider(ncon=3)
-def plane_cylinder(plane: GeomInfo, cylinder: GeomInfo, soft: bool, softjax_mode: str) -> Collision:
+def plane_cylinder(
+    plane: GeomInfo,
+    cylinder: GeomInfo,
+    soft: bool,
+    softjax_mode: Optional[str],
+) -> Collision:
   """Calculates three contacts between a cylinder and a plane."""
   n = plane.mat[:, 2]
   axis = cylinder.mat[:, 2]
@@ -216,7 +239,7 @@ def _sphere_sphere(
     pos2: jax.Array,
     radius2: jax.Array,
     soft: bool = False,
-    softjax_mode: str = "hard",
+    softjax_mode: Optional[str] = None,
 ) -> Tuple[jax.Array, jax.Array, jax.Array]:
   """Returns the penetration, contact point, and normal between two spheres."""
   if soft:
@@ -232,7 +255,12 @@ def _sphere_sphere(
 
 
 @collider(ncon=1)
-def sphere_sphere(s1: GeomInfo, s2: GeomInfo, soft: bool, softjax_mode: str) -> Collision:
+def sphere_sphere(
+    s1: GeomInfo,
+    s2: GeomInfo,
+    soft: bool,
+    softjax_mode: Optional[str],
+) -> Collision:
   """Calculates contact between two spheres."""
   dist, pos, n = _sphere_sphere(
       s1.pos, s1.size[0], s2.pos, s2.size[0], soft=soft, softjax_mode=softjax_mode
@@ -243,7 +271,12 @@ def sphere_sphere(s1: GeomInfo, s2: GeomInfo, soft: bool, softjax_mode: str) -> 
 
 
 @collider(ncon=1)
-def sphere_capsule(sphere: GeomInfo, cap: GeomInfo, soft: bool, softjax_mode: str) -> Collision:
+def sphere_capsule(
+    sphere: GeomInfo,
+    cap: GeomInfo,
+    soft: bool,
+    softjax_mode: Optional[str],
+) -> Collision:
   """Calculates one contact between a sphere and a capsule."""
   axis, length = cap.mat[:, 2], cap.size[1]
   segment = axis * length
@@ -264,7 +297,12 @@ def sphere_capsule(sphere: GeomInfo, cap: GeomInfo, soft: bool, softjax_mode: st
 
 
 @collider(ncon=1)
-def capsule_capsule(cap1: GeomInfo, cap2: GeomInfo, soft: bool, softjax_mode: str) -> Collision:
+def capsule_capsule(
+    cap1: GeomInfo,
+    cap2: GeomInfo,
+    soft: bool,
+    softjax_mode: Optional[str],
+) -> Collision:
   """Calculates one contact between two capsules."""
   axis1, length1 = cap1.mat[:, 2], cap1.size[1]
   axis2, length2 = cap2.mat[:, 2], cap2.size[1]

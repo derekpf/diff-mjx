@@ -29,15 +29,13 @@ def run_test(name, xml, expect_zero_grad=False, skip_grad=False):
     dx = mjx.put_data(m, d)
 
     # --- Hard collision ---
-    mx_hard = mx.replace(opt=mx.opt.replace(col_soft_enable=False))
+    mx_hard = mx.replace(opt=mx.opt.replace(softjax_mode=None))
     collision_hard = jax.jit(collision_driver.collision)(mx_hard, dx)
     dist_hard = np.array(collision_hard.contact.dist)
     print(f"  Hard dist: {dist_hard}")
 
     # --- Soft collision, softjax_mode="hard" ---
-    mx_soft_hard = mx.replace(
-        opt=mx.opt.replace(col_soft_enable=True, softjax_mode="hard")
-    )
+    mx_soft_hard = mx.replace(opt=mx.opt.replace(softjax_mode="hard"))
     collision_soft_hard = jax.jit(collision_driver.collision)(mx_soft_hard, dx)
     dist_soft_hard = np.array(collision_soft_hard.contact.dist)
     print(f"  Soft-hard dist: {dist_soft_hard}")
@@ -51,9 +49,7 @@ def run_test(name, xml, expect_zero_grad=False, skip_grad=False):
         passed += 1
 
     # --- Soft collision, softjax_mode="c2" ---
-    mx_soft = mx.replace(
-        opt=mx.opt.replace(col_soft_enable=True, softjax_mode="c2")
-    )
+    mx_soft = mx.replace(opt=mx.opt.replace(softjax_mode="c2"))
     collision_soft = jax.jit(collision_driver.collision)(mx_soft, dx)
     dist_soft = np.array(collision_soft.contact.dist)
     print(f"  Soft-c2 dist: {dist_soft}")

@@ -198,9 +198,7 @@ class SoftCollisionTest(parameterized.TestCase):
     dx = mjx.put_data(m, d)
 
     for mode in ('hard', 'c2'):
-      mx_soft = mx.replace(
-          opt=mx.opt.replace(col_soft_enable=True, softjax_mode=mode)
-      )
+      mx_soft = mx.replace(opt=mx.opt.replace(softjax_mode=mode))
       dx_soft = jax.jit(collision_driver.collision)(mx_soft, dx)
       dist = np.asarray(dx_soft._impl.contact.dist)
       self.assertFalse(
@@ -208,9 +206,7 @@ class SoftCollisionTest(parameterized.TestCase):
           f'{name} softjax_mode={mode} produced NaN distance',
       )
 
-    mx_soft = mx.replace(
-        opt=mx.opt.replace(col_soft_enable=True, softjax_mode='c2')
-    )
+    mx_soft = mx.replace(opt=mx.opt.replace(softjax_mode='c2'))
 
     def soft_collision_loss(qpos):
       dx_mod = dx.replace(qpos=qpos)

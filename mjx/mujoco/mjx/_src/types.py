@@ -509,8 +509,7 @@ class Option(PyTreeNode):
   integrator: IntegratorType
   solver: SolverType
   timestep: jax.Array
-  col_soft_enable: bool
-  softjax_mode: str
+  softjax_mode: Optional[str]
   st_enable: bool
   pw_solimp: Optional[jax.Array]
   scan_loop: bool
