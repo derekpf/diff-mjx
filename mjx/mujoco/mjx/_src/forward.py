@@ -459,7 +459,7 @@ def _forward(m: Model, d: Data, soft: bool) -> Data:
 @named_scope
 def forward(m: Model, d: Data) -> Data:
   pw_enabled = m.opt.pw_solimp is not None
-  if pw_enabled and m.opt.st_enable:
+  if pw_enabled and m.opt.contact_st_enable:
     d_soft = _forward(m, d, soft=True)
     d_hard = _forward(m, d, soft=False)
 

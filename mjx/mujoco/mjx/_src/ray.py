@@ -21,6 +21,7 @@ from jax import numpy as jp
 import mujoco
 import softjax as sj
 from mujoco.mjx._src import math
+from mujoco.mjx._src import softjax
 # pylint: disable=g-importing-member
 from mujoco.mjx._src.types import Data
 from mujoco.mjx._src.types import GeomType
@@ -316,3 +317,77 @@ def ray_geom(
     dist: distance from ray origin to geom surface
   """
   return _RAY_FUNC[geomtype](size, pnt, vec)
+
+
+def _ray_geom_hit(size, pnt, vec, geomtype, softness, mode='smooth'):
+  """Ray eligibility with finite candidates and relaxed validity decisions."""
+  if mode == 'hard':
+    distance = ray_geom(size, pnt, vec, geomtype)
+    return ((distance > 0) & jp.isfinite(distance)).astype(pnt.dtype)
+
+  def greater(x, y):
+    return softjax.greater(x, y, softness=softness, mode=mode)
+
+  def less_equal(x, y):
+    return softjax.less_equal(x, y, softness=softness, mode=mode)
+
+  def quadratic(point, direction, radius):
+    a = direction @ direction
+    b = direction @ point
+    det = b * b - a * (point @ point - radius * radius)
+    root = softjax.sqrt(softjax.relu(
+        det, softness=softness, mode=mode, gated=False))
+    roots = math.safe_div(jp.array([-b - root, -b + root]), a)
+    valid = greater(det, mujoco.mjMINVAL) * greater(roots, 0.)
+    return roots, valid
+
+  if geomtype == GeomType.SPHERE:
+    _, valid = quadratic(pnt, vec, size[0])
+  elif geomtype == GeomType.ELLIPSOID:
+    _, valid = quadratic(math.safe_div(pnt, size),
+                         math.safe_div(vec, size), 1.)
+  elif geomtype == GeomType.CAPSULE:
+    roots, valid = quadratic(pnt[:2], vec[:2], size[0])
+    valid *= less_equal(softjax.abs(pnt[2] + roots * vec[2],
+                                   softness=softness, mode=mode), size[1])
+    candidates = [valid]
+    for sign in (-1., 1.):
+      point = pnt - jp.array([0., 0., sign * size[1]])
+      roots, cap_valid = quadratic(point, vec, size[0])
+      cap_valid *= greater(sign * (pnt[2] + roots * vec[2]), size[1])
+      candidates.append(cap_valid)
+    valid = jp.concatenate(candidates)
+  elif geomtype == GeomType.BOX:
+    axes = jp.array([0, 1, 2, 0, 1, 2])
+    faces = jp.array([(1, 2), (0, 2), (0, 1)] * 2)
+    roots = jp.concatenate([math.safe_div(size - pnt, vec),
+                            -math.safe_div(size + pnt, vec)])
+    points = pnt[faces] + roots[:, None] * vec[faces]
+    inside = less_equal(softjax.abs(points, softness=softness, mode=mode),
+                        size[faces])
+    valid = (greater(roots, 0.) * inside.prod(axis=-1) *
+             greater(softjax.abs(vec[axes], softness=softness, mode=mode),
+                     mujoco.mjMINVAL))
+  elif geomtype == GeomType.PLANE:
+    distance = -math.safe_div(pnt[2], vec[2])
+    point = pnt[:2] + distance * vec[:2]
+    inside = jp.where(size[:2] <= 0, 1., less_equal(
+        softjax.abs(point, softness=softness, mode=mode), size[:2]))
+    valid = (less_equal(vec[2], -mujoco.mjMINVAL) * greater(distance, 0.) *
+             inside.prod())
+  else:
+    raise NotImplementedError(f'Unsupported touch site type: {geomtype}')
+  # The union of candidate intersections replaces hard first-hit selection.
+  return softjax.any(jp.atleast_1d(valid), use_geometric_mean=False)
+
+
+_ray_geom_hit_st = softjax.st(_ray_geom_hit)
+
+
+def ray_geom_hit(size, pnt, vec, geomtype, softness=0.0, st_enable=False,
+                 mode='smooth'):
+  """Touch-only eligibility; ordinary ray/rangefinder evaluation is unchanged."""
+  if softness == 0:
+    return _ray_geom_hit(size, pnt, vec, geomtype, softness, mode='hard')
+  fn = _ray_geom_hit_st if st_enable else _ray_geom_hit
+  return fn(size, pnt, vec, geomtype, softness, mode=mode)

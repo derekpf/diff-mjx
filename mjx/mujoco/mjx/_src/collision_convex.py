@@ -77,7 +77,7 @@ def collider(ncon: int):
           fn,
           soft=softjax_mode is not None,
           softjax_mode=softjax_mode,
-          st_enable=m.opt.st_enable,
+          st_enable=m.opt.contact_st_enable,
       )
       dist, pos, frame = jax.vmap(fn, in_axes=in_axes)(*infos)  # pytype: disable=wrong-keyword-args
       if ncon > 1:
@@ -343,6 +343,7 @@ def plane_convex(
   if soft:
     m = softjax_mode
     smax = sj.max(support, softness=softness, mode=m,
+                  standardize=False, gated_grad=False,
                   st_enable=st_enable)  # Pick vertex with largest penetration.
     thresh = sj.relu(
         smax - 1e-3, softness=softness, mode=m, st_enable=st_enable
@@ -1198,12 +1199,14 @@ def _box_box_impl_soft(
         softness=softness,
         mode=mode,
         standardize=False,
+        gated_grad=False,
         st_enable=st_enable,
     ) - sj.min(
         support_b,
         softness=softness,
         mode=mode,
         standardize=False,
+        gated_grad=False,
         st_enable=st_enable,
     )
     dist2 = sj.max(
@@ -1211,12 +1214,14 @@ def _box_box_impl_soft(
         softness=softness,
         mode=mode,
         standardize=False,
+        gated_grad=False,
         st_enable=st_enable,
     ) - sj.min(
         support_a,
         softness=softness,
         mode=mode,
         standardize=False,
+        gated_grad=False,
         st_enable=st_enable,
     )
     candidates = jp.stack([dist1, dist2])

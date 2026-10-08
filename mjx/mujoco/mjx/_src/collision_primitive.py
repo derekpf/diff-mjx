@@ -43,7 +43,7 @@ def collider(ncon: int):
           func,
           soft=softjax_mode is not None,
           softjax_mode=softjax_mode,
-          st_enable=m.opt.st_enable,
+          st_enable=m.opt.contact_st_enable,
       )
       dist, pos, frame = jax.vmap(fn)(info1, info2)
       if ncon > 1:

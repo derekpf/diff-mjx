@@ -61,7 +61,7 @@ class ForwardTest(absltest.TestCase):
     pw_solimp = jp.array([0.9, 0.95, 0.002, 0.5, 2.0])
 
     def contact_force(pw_solimp, st_enable, qpos):
-      opt = mx.opt.replace(pw_solimp=pw_solimp, st_enable=st_enable)
+      opt = mx.opt.replace(pw_solimp=pw_solimp, contact_st_enable=st_enable)
       return mjx.forward(
           mx.replace(opt=opt), dx.replace(qpos=qpos)
       ).qfrc_constraint[2]

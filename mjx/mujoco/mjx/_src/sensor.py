@@ -21,6 +21,7 @@ import mujoco
 from mujoco.mjx._src import math
 from mujoco.mjx._src import ray
 from mujoco.mjx._src import smooth
+from mujoco.mjx._src import softjax as sj
 from mujoco.mjx._src import support
 from mujoco.mjx._src.types import Data
 from mujoco.mjx._src.types import DataJAX
@@ -35,12 +36,24 @@ import numpy as np
 
 
 def _apply_cutoff(
-    sensor: jax.Array, cutoff: jax.Array, data_type: int
+    sensor: jax.Array, cutoff: jax.Array, data_type: int,
+    softness: float = 0.0, st_enable: bool = False, mode: str = 'smooth',
 ) -> jax.Array:
   """Clip sensor to cutoff value."""
 
   @jax.vmap
   def fn(sensor, cutoff):
+    if softness > 0:
+      if data_type == mujoco.mjtDataType.mjDATATYPE_REAL:
+        clipped = sj.clip(sensor, -cutoff, cutoff, softness=softness,
+                          mode=mode, st_enable=st_enable, gated=False)
+      elif data_type == mujoco.mjtDataType.mjDATATYPE_POSITIVE:
+        clipped = sj.min(jp.stack([sensor, cutoff]), softness=softness,
+                         mode=mode, st_enable=st_enable, standardize=False,
+                         gated_grad=False)
+      else:
+        return sensor
+      return jp.where(cutoff > 0, clipped, sensor)
     if data_type == mujoco.mjtDataType.mjDATATYPE_REAL:
       return jp.where(cutoff > 0, jp.clip(sensor, -cutoff, cutoff), sensor)
     elif data_type == mujoco.mjtDataType.mjDATATYPE_POSITIVE:
@@ -49,6 +62,40 @@ def _apply_cutoff(
       return sensor
 
   return fn(sensor, cutoff)
+
+
+def _contact_values(hard, match, payload, gap, score, num, reduction,
+                    softness, mode='smooth', gated_grad=True,
+                    direct_payload=None):
+  """Relax the complete contact output, including inactive-slot eligibility."""
+  if mode == 'hard':
+    return hard
+  count = jp.sum(match * sj.less(gap, 0., softness=softness, mode=mode), axis=-1)
+  if reduction:
+    score = jp.broadcast_to(score, match.shape)
+    score = jp.where(match, score, -jp.max(jp.abs(score), axis=-1,
+                                          keepdims=True) - 1.)
+    # Differentiate ranks for fields that change when the winning contact
+    # changes. Score-aligned fields can use direct convex selection weights.
+    _, weights = sj.top_k(score, num, softness=softness, mode=mode,
+                         method='neuralsort', standardize=False,
+                         gated_grad=gated_grad)
+    weights *= match[:, None, :]
+    weights = math.safe_div(weights, weights.sum(axis=-1, keepdims=True))
+  else:
+    weights = jp.broadcast_to(jax.nn.one_hot(jp.arange(num), match.shape[-1]),
+                              (match.shape[0], num, match.shape[-1]))
+  values = jp.einsum('skn,snd->skd', weights, payload)
+  if direct_payload is not None:
+    direct_values = jp.einsum(
+        'skn,snd->skd', jax.lax.stop_gradient(weights), payload)
+    values = jp.where(direct_payload[None, None, :], direct_values, values)
+  eligible = sj.greater(count[:, None], jp.arange(num),
+                        softness=softness, mode=mode)
+  return (eligible[..., None] * values).reshape(-1)
+
+
+_contact_values_st = sj.st(_contact_values)
 
 
 def sensor_pos(m: Model, d: Data) -> Data:
@@ -167,7 +214,8 @@ def sensor_pos(m: Model, d: Data) -> Data:
         sensor, _ = jax.vmap(
             ray.ray, in_axes=(None, None, 0, 0, None, None, None)
         )(m, d, site_xpos, site_mat, (), True, sid)
-        sensors.append(_apply_cutoff(sensor, cutoffs, data_type[0]))
+        sensors.append(_apply_cutoff(sensor, cutoffs, data_type[0], m.opt.sensor_softness,
+                                    m.opt.sensor_st_enable, m.opt.softjax_mode or "smooth"))
         adrs.append(adr[idxs])
       continue  # avoid adding to sensors/adrs list a second time
     elif sensor_type == SensorType.JOINTPOS:
@@ -198,7 +246,8 @@ def sensor_pos(m: Model, d: Data) -> Data:
         cutofft = cutoff[idxt]
         sensor = jax.vmap(_framepos)(xpos, xpos_ref, xmat_ref, refidt)
         adrt = adr[idxt, None] + np.arange(3)[None]
-        sensors.append(_apply_cutoff(sensor, cutofft, data_type[0]).reshape(-1))
+        sensors.append(_apply_cutoff(sensor, cutofft, data_type[0], m.opt.sensor_softness,
+                                    m.opt.sensor_st_enable, m.opt.softjax_mode or "smooth").reshape(-1))
         adrs.append(adrt.reshape(-1))
       continue  # avoid adding to sensors/adrs list a second time
     elif sensor_type in frame_axis:
@@ -218,7 +267,8 @@ def sensor_pos(m: Model, d: Data) -> Data:
         cutofft = cutoff[idxt]
         sensor = jax.vmap(_frameaxis)(xmat, xmat_ref, refidt)
         adrt = adr[idxt, None] + np.arange(3)[None]
-        sensors.append(_apply_cutoff(sensor, cutofft, data_type[0]).reshape(-1))
+        sensors.append(_apply_cutoff(sensor, cutofft, data_type[0], m.opt.sensor_softness,
+                                    m.opt.sensor_st_enable, m.opt.softjax_mode or "smooth").reshape(-1))
         adrs.append(adrt.reshape(-1))
       continue  # avoid adding to sensors/adrs list a second time
     elif sensor_type == SensorType.FRAMEQUAT:
@@ -259,7 +309,8 @@ def sensor_pos(m: Model, d: Data) -> Data:
             )
         )(quat, refquat, refidt)
         adrt = adr[idxt, None] + np.arange(4)[None]
-        sensors.append(_apply_cutoff(sensor, cutofft, data_type[0]).reshape(-1))
+        sensors.append(_apply_cutoff(sensor, cutofft, data_type[0], m.opt.sensor_softness,
+                                    m.opt.sensor_st_enable, m.opt.softjax_mode or "smooth").reshape(-1))
         adrs.append(adrt.reshape(-1))
       continue  # avoid adding to sensors/adrs list a second time
     elif sensor_type == SensorType.SUBTREECOM:
@@ -271,7 +322,8 @@ def sensor_pos(m: Model, d: Data) -> Data:
       # TODO(taylorhowell): raise error after adding sensor check to io.py
       continue  # unsupported sensor type
 
-    sensors.append(_apply_cutoff(sensor, cutoff, data_type[0]).reshape(-1))
+    sensors.append(_apply_cutoff(sensor, cutoff, data_type[0], m.opt.sensor_softness,
+                                    m.opt.sensor_st_enable, m.opt.softjax_mode or "smooth").reshape(-1))
     adrs.append(adr)
 
   if not adrs:
@@ -399,7 +451,8 @@ def sensor_vel(m: Model, d: Data) -> Data:
 
         adrt = adr[idxt, None] + np.arange(3)[None]
 
-        sensors.append(_apply_cutoff(sensor, cutofft, data_type[0]).reshape(-1))
+        sensors.append(_apply_cutoff(sensor, cutofft, data_type[0], m.opt.sensor_softness,
+                                    m.opt.sensor_st_enable, m.opt.softjax_mode or "smooth").reshape(-1))
         adrs.append(adrt.reshape(-1))
       continue  # avoid adding to sensors/adrs list a second time
     elif sensor_type == SensorType.SUBTREELINVEL:
@@ -412,7 +465,8 @@ def sensor_vel(m: Model, d: Data) -> Data:
       # TODO(taylorhowell): raise error after adding sensor check to io.py
       continue  # unsupported sensor type
 
-    sensors.append(_apply_cutoff(sensor, cutoff, data_type[0]).reshape(-1))
+    sensors.append(_apply_cutoff(sensor, cutoff, data_type[0], m.opt.sensor_softness,
+                                    m.opt.sensor_st_enable, m.opt.softjax_mode or "smooth").reshape(-1))
     adrs.append(adr)
 
   if not adrs:
@@ -505,34 +559,46 @@ def sensor_acc(m: Model, d: Data) -> Data:
       )(d._impl.contact.frame, contact_force)
       conray = jp.where(conbody1[..., None], -conray, conray)
 
-      # compute distance, mapping over sites and contacts
-      def _distance(site_size, site_xpos, site_xmat, site_type, pos, conray):
-        def dist(size, xpos, xmat, conray):
-          pnt = (pos - xpos) @ xmat
-          vec = conray @ xmat
-          ray_geom_ = lambda pnt, vec: ray.ray_geom(size, pnt, vec, site_type)
-          return jax.vmap(ray_geom_)(pnt, vec)
-
+      # Compute ray eligibility without discarding miss gradients in soft mode.
+      def _distance(site_size, site_xpos, site_xmat, site_type, conray,
+                    softness, mode):
+        def dist(size, xpos, xmat, vectors):
+          point = (d._impl.contact.pos - xpos) @ xmat
+          vectors = vectors @ xmat
+          if softness > 0:
+            fn = lambda p, v: ray.ray_geom_hit(
+                size, p, v, site_type, softness, mode=mode)
+          else:
+            fn = lambda p, v: ray.ray_geom(size, p, v, site_type)
+          return jax.vmap(fn)(point, vectors)
         return jax.vmap(dist)(site_size, site_xpos, site_xmat, conray)
 
-      dist = []
-      dist_id = []
-      for st in set(site_type):
-        (dist_id_site,) = np.nonzero(st == site_type)
-        dist_site = _distance(
-            site_size[dist_id_site],
-            site_xpos[dist_id_site],
-            site_xmat[dist_id_site],
-            st,
-            d._impl.contact.pos,
-            conray[dist_id_site],
-        )
-        dist.append(jp.where(jp.isinf(dist_site), 0, dist_site))
-        dist_id.append(dist_id_site)
-      dist = jp.vstack(dist)[np.argsort(np.concatenate(dist_id))]
+      def touch_values(mode='smooth'):
+        softness = 0. if mode == 'hard' else m.opt.sensor_softness
+        distances, ids = [], []
+        for st in set(site_type):
+          (site_ids,) = np.nonzero(st == site_type)
+          value = _distance(site_size[site_ids], site_xpos[site_ids],
+                            site_xmat[site_ids], st, conray[site_ids],
+                            softness, mode)
+          distances.append(jp.where(jp.isinf(value), 0., value))
+          ids.append(site_ids)
+        distances = jp.vstack(distances)[np.argsort(np.concatenate(ids))]
+        if mode == 'hard':
+          return jp.dot((distances > 0) & contacts, contact_force[:, 0])
+        eligibility = sj.less(
+            d._impl.contact.dist - d._impl.contact.includemargin, 0.,
+            softness=softness, mode=mode)
+        return jp.dot(distances * (conbody0 | conbody1) * eligibility,
+                      contact_force[:, 0])
 
-      # accumulate normal forces for each site
-      sensor = jp.dot((dist > 0) & contacts, contact_force[:, 0])
+      if m.opt.sensor_softness > 0:
+        # ST on the complete sum preserves nominal values while allowing
+        # gradients through inactive contact and sensor-zone eligibility.
+        fn = sj.st(touch_values) if m.opt.sensor_st_enable else touch_values
+        sensor = fn(mode=m.opt.softjax_mode or 'smooth')
+      else:
+        sensor = touch_values(mode='hard')
     elif sensor_type == SensorType.CONTACT:
       # maximum number of contacts
       ncon = d._impl.ncon
@@ -680,7 +746,57 @@ def sensor_acc(m: Model, d: Data) -> Data:
           slot.append(flip[:, 2, None] * d._impl.contact.frame[cid, 1])
 
         found = jp.tile(jp.arange(num), nsensor) < jp.repeat(nfound, num)
-        sensors.append((found[:, None] * jp.hstack(slot)).reshape(-1))
+        values = (found[:, None] * jp.hstack(slot)).reshape(-1)
+        if m.opt.sensor_softness > 0 and num:
+          matches = jp.broadcast_to(match, (nsensor, ncon))
+          if objtype == ObjType.UNKNOWN and reftype == ObjType.UNKNOWN:
+            candidate_flip = jp.ones((nsensor, ncon, 3))
+          else:
+            if reftype == ObjType.UNKNOWN:
+              is_flip = geomid1[None, :] == sensorid1[:, None]
+            elif objtype == ObjType.UNKNOWN:
+              is_flip = geomid0[None, :] == sensorid2[:, None]
+            else:
+              is_flip = jp.broadcast_to((sensorid1 > sensorid2)[:, None],
+                                        (nsensor, ncon))
+            candidate_flip = jp.where(is_flip[..., None],
+                                      jp.array([1., 1., -1.]), jp.ones(3))
+          payload = []
+          direct_payload = []
+          for bit, value in enumerate([
+              None,
+              contact_force[:, :3] if contact_dataforce else None,
+              contact_force[:, 3:] if contact_datatorque else None,
+              dist[:, None], d._impl.contact.pos,
+              d._impl.contact.frame[:, 0], d._impl.contact.frame[:, 1],
+          ]):
+            if not dataspec & (1 << bit):
+              continue
+            if bit == 0:
+              count = (matches * sj.less(pos, 0., softness=m.opt.sensor_softness,
+                         mode=m.opt.softjax_mode or 'smooth')).sum(axis=-1)
+              value = jp.broadcast_to(count[:, None, None], (nsensor, ncon, 1))
+            else:
+              value = jp.broadcast_to(value, (nsensor,) + value.shape)
+              if bit in (1, 2):
+                value = value * candidate_flip
+              elif bit in (5, 6):
+                value = value * candidate_flip[..., 2, None]
+            payload.append(value)
+            direct_payload.extend([
+                bit == 0 or (reduce == 1 and bit == 3)
+                or (reduce == 2 and bit == 1)
+            ] * value.shape[-1])
+          score = -pos if reduce == 1 else (
+              force_mag if reduce == 2 else jp.zeros_like(pos))
+          fn = _contact_values_st if m.opt.sensor_st_enable else _contact_values
+          values = fn(values, matches, jp.concatenate(payload, axis=-1), pos,
+                      score, num, reduce if dataspec != 1 else 0,
+                      m.opt.sensor_softness,
+                      mode=m.opt.softjax_mode or 'smooth',
+                      direct_payload=(jp.array(direct_payload)
+                                      if reduce != 0 and dataspec != 1 else None))
+        sensors.append(values)
         adrs.append(
             (adr[idx_ds][:, None] + np.arange(num * size)[None]).reshape(-1)
         )
@@ -774,7 +890,8 @@ def sensor_acc(m: Model, d: Data) -> Data:
       # TODO(taylorhowell): raise error after adding sensor check to io.py
       continue  # unsupported sensor type
 
-    sensors.append(_apply_cutoff(sensor, cutoff, data_type[0]).reshape(-1))
+    sensors.append(_apply_cutoff(sensor, cutoff, data_type[0], m.opt.sensor_softness,
+                                    m.opt.sensor_st_enable, m.opt.softjax_mode or "smooth").reshape(-1))
     adrs.append(adr)
 
   if not adrs:

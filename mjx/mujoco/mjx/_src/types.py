@@ -510,7 +510,9 @@ class Option(PyTreeNode):
   solver: SolverType
   timestep: jax.Array
   softjax_mode: Optional[str]
-  st_enable: bool
+  contact_st_enable: bool
+  sensor_softness: float
+  sensor_st_enable: bool
   pw_solimp: Optional[jax.Array]
   scan_loop: bool
   _impl: Union[OptionJAX, mjxw_types.OptionWarp]

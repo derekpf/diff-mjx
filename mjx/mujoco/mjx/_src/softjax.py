@@ -44,6 +44,7 @@ greater = _with_st_enable(_softjax.greater, _softjax.greater_st)
 greater_equal = _with_st_enable(_softjax.greater_equal,
                                 _softjax.greater_equal_st)
 less = _with_st_enable(_softjax.less, _softjax.less_st)
+less_equal = _with_st_enable(_softjax.less_equal, _softjax.less_equal_st)
 max = _with_st_enable(_softjax.max, _softjax.max_st)
 min = _with_st_enable(_softjax.min, _softjax.min_st)
 relu = _with_st_enable(_softjax.relu, _softjax.relu_st)
@@ -57,4 +58,8 @@ dynamic_index_in_dim = _softjax.dynamic_index_in_dim
 logical_and = _softjax.logical_and
 logical_not = _softjax.logical_not
 norm = _softjax.norm
+sqrt = _softjax.sqrt
 where = _softjax.where
+st = _softjax.st
+top_k = _softjax.top_k
+take = _softjax.take

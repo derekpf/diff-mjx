@@ -247,7 +247,7 @@ class SoftCollisionTest(parameterized.TestCase):
 
     def contact(mode, st_enable):
       model = mx.replace(opt=mx.opt.replace(
-          softjax_mode=mode, st_enable=st_enable, pw_solimp=None
+          softjax_mode=mode, contact_st_enable=st_enable, pw_solimp=None
       ))
       result = jax.jit(collision_driver.collision)(model, dx)._impl.contact
       return result.dist, result.pos, result.frame
@@ -270,7 +270,7 @@ class SoftCollisionTest(parameterized.TestCase):
                           for a, b in zip(soft, straight_through)), name)
 
     model = mx.replace(opt=mx.opt.replace(
-        softjax_mode=mode, st_enable=True, pw_solimp=None
+        softjax_mode=mode, contact_st_enable=True, pw_solimp=None
     ))
     def contact_vector(qpos):
       data = smooth.kinematics(model, dx.replace(qpos=qpos))
