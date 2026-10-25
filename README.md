@@ -82,7 +82,7 @@ inputs. These defaults stay unchanged.
 
 ## diff-mjx changes
 
-- **Per-operation ST wiring.** Propagates `opt.contact_st_enable` (default `False`) through softened collision and contact-physics operations, preserving nominal hard forward values while using surrogate gradients. Forlax's `DiffContactWrapper` exposes the same `contact_st_enable` argument, independently of `sensor_st_enable`.
+- **Per-operation ST wiring.** Propagates `opt.contact_st_enable` (default `False`) through softened collision and contact-physics operations, preserving nominal hard forward values while using surrogate gradients.
 
 - **Closer nominal MJX behavior.** Corrects collision feature selection, tie-breaking, normalization, contact masks, duplicate contacts, and sign conventions.
 
@@ -98,7 +98,7 @@ inputs. These defaults stay unchanged.
 
 - **Dynamics consistency.** Shares straight-through handling between forward and inverse piecewise-solimp calculations; limits contact-specific clamping to contact constraints.
 
-- **Independent sensor options.** Adds MJX options `sensor_softness=0.0` and `sensor_st_enable=False`, loaded during model conversion and exposed through Forlax's `DiffContactWrapper`. They are independent of reward and physics-contact settings.
+- **Independent sensor options.** Adds MJX options `sensor_softness=0.0` and `sensor_st_enable=False`, loaded during model conversion. They are independent of reward and physics-contact settings.
 
 - **Sensor forward/backward behavior.** Zero softness preserves nominal behavior. Positive softness enables relaxed forward/backward evaluation; enabling sensor ST preserves nominal forward values with surrogate gradients. Relaxations use `softjax_mode`, falling back to `"smooth"`.
 

@@ -50,7 +50,7 @@ def _apply_cutoff(
       elif data_type == mujoco.mjtDataType.mjDATATYPE_POSITIVE:
         clipped = sj.min(jp.stack([sensor, cutoff]), softness=softness,
                          mode=mode, st_enable=st_enable, standardize=False,
-                         gated_grad=False)
+                         gated_grad=True)
       else:
         return sensor
       return jp.where(cutoff > 0, clipped, sensor)
