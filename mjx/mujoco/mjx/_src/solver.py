@@ -675,15 +675,20 @@ def _solve_scan(m: Model, d: Data) -> Data:
 
 
 def _root(m: Model, d: Data, qacc: jax.Array) -> jax.Array:
+  """Stationarity residual ``M qacc - qfrc_smooth - qfrc_constraint``."""
   ctx = Context.create(m, d.replace(qacc=qacc), grad=False)
-  ctx = _update_gradient(m, d, ctx)
-  return ctx.grad
+  return ctx.Ma - d.qfrc_smooth - ctx.qfrc_constraint
 
 
 def _root_iterative_solve(
     m: Model, d: Data, qacc: jax.Array
 ) -> tuple[jax.Array, jax.Array]:
-  """Runs the solver to convergence; returns (qacc, realised iterations)."""
+  """Runs the solver to convergence; returns (qacc, realised iterations).
+
+  This solve is never differentiated, so it uses the masked scan rather than
+  ``lax.while_loop``, which is slow on GPU; results and iteration counts are
+  identical to the while loop.
+  """
   d = d.replace(qacc=qacc)
   ctx = Context.create(m, d)
 
@@ -696,7 +701,7 @@ def _root_iterative_solve(
   if m.opt.iterations == 1:
     ctx = body(ctx)
   else:
-    ctx = jax.lax.while_loop(cond, body, ctx)
+    ctx = _while_loop_scan(cond, body, ctx, max_iter=m.opt.iterations)
 
   # Float, not int: custom_root's JVP gives integer aux outputs an integer
   # tangent, which JAX rejects (integer tangents must be float0).
@@ -704,9 +709,15 @@ def _root_iterative_solve(
 
 
 def _root_tangent_solve(g, y):
-  jacobian = jax.jacobian(g)(y)
-  q, r = jp.linalg.qr(jacobian, mode='reduced')
-  return jp.linalg.solve(r, q.T @ y)
+  """Solves ``g(x) = y`` for the linear map ``g`` of the residual Jacobian.
+
+  ``custom_root`` reverse-differentiates by transposing this function in
+  ``y``, so it must be exactly linear in ``y`` (rules out iterative solves).
+  """
+  # g is linear, so applying it to the identity columns gives its matrix.
+  eye = jp.eye(y.shape[0], dtype=y.dtype)
+  a = jax.vmap(g, out_axes=1)(eye)
+  return jp.linalg.solve(a, y)
 
 
 def _solve_ift(m: Model, d: Data) -> Data:
@@ -760,8 +771,9 @@ def solve(m: Model, d: Data) -> Data:
   - ``scan``: fixed-depth unroll of exactly ``opt.iterations`` steps with no
     convergence check; differentiates through every step.
   - ``ift``: implicit-function-theorem gradient via ``lax.custom_root``. The
-    forward value is the ``while`` solve; the backward pass solves the adjoint
-    of the stationarity residual. The gradient is that of the converged fixed
+    forward value equals the ``while`` solve (computed with a masked scan);
+    the backward pass solves the adjoint of the stationarity residual with a
+    dense LU factorization. The gradient is that of the converged fixed
     point, so it differs from the truncated solve when the forward solve
     stops before convergence (e.g. ``opt.iterations == 1``).
 
