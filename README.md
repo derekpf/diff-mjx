@@ -118,10 +118,12 @@ The JAX constraint solver can be differentiated in several ways, selected by the
 
 | `MJX_GRAD_BACKEND` | forward loop | gradient |
 |---|---|---|
-| unset / `default` | masked scan (`opt.scan_loop=True`, freezes after convergence) or `while_loop` | unrolled through the iterations; unchanged diff-mjx behavior |
+| unset / `ift` | masked scan, never differentiated | implicit function theorem on the stationarity residual |
+| `unrolled` | masked scan (`opt.scan_loop=True`, freezes after convergence) or `while_loop` | unrolled through the iterations; the diff-mjx behavior before `ift` became the default |
 | `while` | `lax.while_loop` | reverse mode only for `opt.iterations == 1` (upstream MJX) |
 | `scan` | exactly `opt.iterations` steps, no convergence check | unrolled through every step |
-| `ift` | masked scan, never differentiated | implicit function theorem on the stationarity residual |
+
+`ift` is the default. Set `MJX_GRAD_BACKEND=unrolled` to restore the previous unrolled gradient. Results recorded before this change call the unrolled backend `default`.
 
 The variable is read when a function is **traced**, so set it before `jax.jit` traces (or compiles) the function; already-compiled functions keep their backend.
 
@@ -139,7 +141,7 @@ The variable is read when a function is **traced**, so set it before `jax.jit` t
   - the warmstart is already the solution (static or standing contact): the line search reports no improvement, and the masked update carries no derivative;
   - the cone is elliptic: the last improving Newton step used the Hessian of a different cone zone (about 6% error, independent of the iteration count);
   - the solver is CG: errors of 100% or more.
-- **Non-finite gradients from other sources are not affected.** In the G1 joystick environment, non-finite gradients occurred at similar rates under `default` and `ift`, so they originate outside the constraint-solver differentiation.
+- **Non-finite gradients from other sources are not affected.** In the G1 joystick environment, non-finite gradients occurred at similar rates under `unrolled` and `ift`, so they originate outside the constraint-solver differentiation.
 
 **Cost.** The `ift` backward does one `nv x nv` matrix build, one LU solve, and one residual VJP per solve, independent of `opt.iterations`, and it stores no per-iteration residuals. Unrolled backward time and memory grow with the iteration count.
 
@@ -147,12 +149,12 @@ Measured on BPTT through the diff-playground `G1JoystickFlatTerrain` environment
 
 | backend | forward | backward | forward + backward | memory |
 |---|---:|---:|---:|---:|
-| `default`, no remat | – | – | out of memory (needs ~19 GiB) | – |
-| `default` + per-step remat | 355 ms | 1583 ms | 1767 ms | 1.33 GB |
+| `unrolled`, no remat | – | – | out of memory (needs ~19 GiB) | – |
+| `unrolled` + per-step remat | 355 ms | 1583 ms | 1767 ms | 1.33 GB |
 | `ift` + per-step remat | 355 ms | 1071 ms | 1252 ms (1.41x faster) | 0.38 GB |
 | `ift`, no remat | 356 ms | 359 ms | 1027 ms (1.72x faster) | 5.76 GB |
 
-Remat is `jax.remat(env.step, prevent_cse=False)`, as in forlax's `remat_enable`. The tangent solve (matrix build plus LU) is now about 3% of the `ift` backward; the rest is differentiating the environment itself. In this environment, about 45% of envs produced non-finite gradients over 16 steps under both `default` and `ift`.
+Remat is `jax.remat(env.step, prevent_cse=False)`, as in forlax's `remat_enable`. The tangent solve (matrix build plus LU) is now about 3% of the `ift` backward; the rest is differentiating the environment itself. In this environment, about 45% of envs produced non-finite gradients over 16 steps under both `unrolled` and `ift`.
 
 Benchmarks, validation scripts, raw results, and reproduction commands are in [`mjx/benchmarks/ift_solver`](mjx/benchmarks/ift_solver/README.md).
 

@@ -24,12 +24,12 @@ import time
 
 _HERE = pathlib.Path(__file__).parent
 
-BACKENDS = ('default', 'scan', 'ift')
+BACKENDS = ('unrolled', 'scan', 'ift')
 
 
 @dataclasses.dataclass
 class Config:
-  backend: str = 'default'
+  backend: str = 'unrolled'
   batch: int = 256
   horizon: int = 16
   warmup: int = 20
@@ -191,7 +191,7 @@ def main():
                   default=str(_HERE / 'results' / 'g1_env_runs.jsonl'))
   ap.add_argument('--seeds', type=int, nargs='*', default=[0, 1, 2])
   ap.add_argument('--backends', nargs='*', default=[
-      'default+remat', 'scan+remat', 'ift', 'ift+remat', 'default'],
+      'unrolled+remat', 'scan+remat', 'ift', 'ift+remat', 'unrolled'],
                   help='backends; suffix +remat for per-step remat')
   ap.add_argument('--ckpt', action='store_true')
   args = ap.parse_args()

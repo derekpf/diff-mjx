@@ -45,7 +45,7 @@ _HERE = pathlib.Path(__file__).parent
 class Config:
   scene: str = 'go1'
   workload: str = 'rollout'  # step | rollout
-  backend: str = 'ift'  # while | default | scan | ift
+  backend: str = 'ift'  # while | unrolled | scan | ift
   iterations: int = 3
   ls_iterations: int = 5
   tolerance: float = 1e-8
@@ -264,7 +264,7 @@ def _worker(cfg: Config) -> dict:
   return res
 
 
-BACKENDS = ('while', 'default', 'scan', 'ift')
+BACKENDS = ('while', 'unrolled', 'scan', 'ift')
 
 
 def _backend_env(name: str) -> str:
@@ -332,7 +332,7 @@ def _fmt(res: dict) -> str:
   return s
 
 
-MAIN = ('default', 'scan', 'ift')
+MAIN = ('unrolled', 'scan', 'ift')
 
 
 def sweep(name: str, backends=None) -> list:
@@ -364,7 +364,7 @@ def sweep(name: str, backends=None) -> list:
     for h in (1, 8, 16, 32):
       per_backend(scene='go1', workload='rollout', iterations=3, batch=256,
                   horizon=h, reps=10)
-      for b in ('default', 'scan'):
+      for b in ('unrolled', 'scan'):
         add(scene='go1', workload='rollout', iterations=3, batch=256,
             horizon=h, backend=b, checkpoint='step', reps=10)
       add(scene='go1', workload='rollout', iterations=3, batch=256,

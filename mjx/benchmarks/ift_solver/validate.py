@@ -8,7 +8,7 @@ Runs in float64 (CPU recommended) and writes one JSON file per study:
 
 Studies
   matrix      converged single-step gradients for every scene x cone x solver
-              x warmstart x parameter kind; IFT / scan / default vs central FD.
+              x warmstart x parameter kind; IFT / scan / unrolled vs central FD.
   iterations  IFT vs unrolled gradients when the solve is truncated to K
               iterations, against FD of both the truncated and the converged
               solve. This is the regime of opt.iterations = 1..3 used in RL.
@@ -61,7 +61,7 @@ def _put(scene):
 def forward_equivalence(mx, dx) -> dict:
   """Forward outputs of every backend relative to the while solver."""
   outs = {}
-  for name in ('while', 'default', 'scan', 'ift'):
+  for name in ('while', 'unrolled', 'scan', 'ift'):
     outs[name] = gc.compile_with(name, mjx.forward, mx, dx)(mx, dx)
   ref = outs['while']
   res = {'while_diag': gc.solution_diagnostics(mx, ref)}
@@ -167,7 +167,7 @@ def study_iterations(args) -> list:
           fd_c = {e: np.asarray(gc.compile_with(
               'while', lambda x, e=e: gc.central_fd(f_c, x, e), th)(th))
                   for e in gc.FD_EPS}
-          for b in ('ift', 'scan', 'default'):
+          for b in ('ift', 'scan', 'unrolled'):
             g = np.asarray(gc.grad_fn(mx, dx, kind, b)(th))
             r[b] = {
                 'vs_fd_truncated_per_component': gc.compare_per_component(
@@ -237,7 +237,7 @@ def _summ_roll(row) -> str:
     return head + ' ERROR ' + row['error'][:200]
   e = {b: v['fd_best']['rel_err'] for b, v in row['backends'].items()}
   return (head + f" ift={e['ift']:.1e} scan={e['scan']:.1e} "
-          f"default={e['default']:.1e} "
+          f"unrolled={e['unrolled']:.1e} "
           f"i/s={row['pairwise']['ift_vs_scan']['rel_err']:.1e} "
           f"fd_drift={max(row['fd_drift'].values()):.1e}")
 

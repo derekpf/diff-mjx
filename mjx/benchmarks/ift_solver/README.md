@@ -1,7 +1,7 @@
 # Implicit vs unrolled differentiation of the MJX constraint solver
 
 Benchmarks and validation for the `MJX_GRAD_BACKEND` solver backends
-(`default`, `while`, `scan`, `ift`). The backends are documented in the
+(`ift`, the default, plus `unrolled`, `while`, `scan`). The backends are documented in the
 repository README ("Constraint-solver derivative backends").
 
 ## Results
@@ -12,7 +12,7 @@ validation ran in float64 on CPU.
 
 | file | contents | produced by |
 |---|---|---|
-| `g1_env.json` | G1 joystick env BPTT: `default`/`ift`, with and without remat, plus tangent-solve headroom runs | `g1_env_bench.py` (headroom runs: same harness with the solver patched at runtime) |
+| `g1_env.json` | G1 joystick env BPTT: `default` (now `unrolled`)/`ift`, with and without remat, plus tangent-solve headroom runs | `g1_env_bench.py` (headroom runs: same harness with the solver patched at runtime) |
 | `variants.jsonl` | IFT implementation variants on G1/Go1 rollouts (forward-loop and tangent-solve speedups) | `bench.py` (the `variants` sweep, since removed) |
 | `tangent_go1.json`, `tangent_g1.json` | tangent-solve components: matrix build, QR/LU/Cholesky cost and float32 accuracy | `profile_tangent.py` |
 | `validation_matrix.json`, `validation_rollout.json` | float64 gradients vs central finite differences, per scene/cone/solver, single step and rollouts | `validate.py` |
@@ -20,14 +20,15 @@ validation ran in float64 on CPU.
 These files were recorded while the IFT implementation was still
 configurable, so some use older variant names: `ift_ref` is the faithful
 port of calumarnott/mujoco (commit e453381c), and `ift_ABDm` is the current
-`ift`. The float64 validation ran on the faithful port; the current `ift`
+`ift`; `default` is the backend now called `unrolled`. The float64
+validation ran on the faithful port; the current `ift`
 matches it to 1e-14 relative or better, and `solver_grad_test.py` repeats the
 finite-difference checks on the current code.
 
 ## Selecting a backend
 
 ```bash
-export MJX_GRAD_BACKEND=ift        # default | while | scan | ift
+export MJX_GRAD_BACKEND=ift        # ift (default) | unrolled | while | scan
 ```
 
 The variable is read when a function is **traced**; already-compiled
@@ -36,10 +37,10 @@ functions keep their backend. Trace inside the setting (e.g. compile with
 
 | backend | forward loop | reverse mode | notes |
 |---|---|---|---|
-| unset / `default` | masked scan (`opt.scan_loop`) or while | unrolled | unchanged diff-mjx behaviour |
+| unset / `ift` | masked scan (not differentiated) | implicit (`lax.custom_root`) | gradient of the converged fixed point |
+| `unrolled` | masked scan (`opt.scan_loop`) or while | unrolled | diff-mjx behaviour before `ift` became the default |
 | `while` | `lax.while_loop` | only `iterations == 1` | upstream MJX |
 | `scan` | fixed `opt.iterations` steps | unrolled | reference fork's `scan` |
-| `ift` | masked scan (not differentiated) | implicit (`lax.custom_root`) | gradient of the converged fixed point |
 
 ## Running
 

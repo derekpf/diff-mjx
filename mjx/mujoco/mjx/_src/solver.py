@@ -615,7 +615,7 @@ def _check_jax_impl(m: Model):
     raise ValueError('solve requires JAX backend implementation.')
 
 
-def _solve_default(m: Model, d: Data) -> Data:
+def _solve_unrolled(m: Model, d: Data) -> Data:
   """diff-mjx solver: masked scan if ``opt.scan_loop``, else while loop."""
   _check_jax_impl(m)
 
@@ -738,8 +738,10 @@ def _solve_ift(m: Model, d: Data) -> Data:
   return _finish_solve(d, ctx)
 
 
+_DEFAULT_BACKEND = 'ift'
+
 _BACKENDS = {
-    'default': _solve_default,
+    'unrolled': _solve_unrolled,
     'while': _solve_while,
     'scan': _solve_scan,
     'ift': _solve_ift,
@@ -748,7 +750,10 @@ _BACKENDS = {
 
 def grad_backend() -> str:
   """Returns the solver backend selected by ``MJX_GRAD_BACKEND``."""
-  backend = os.environ.get('MJX_GRAD_BACKEND', '').strip().lower() or 'default'
+  backend = (
+      os.environ.get('MJX_GRAD_BACKEND', '').strip().lower()
+      or _DEFAULT_BACKEND
+  )
   if backend not in _BACKENDS:
     raise ValueError(
         f'unsupported MJX_GRAD_BACKEND={backend!r}; expected one of '
@@ -763,17 +768,18 @@ def solve(m: Model, d: Data) -> Data:
   ``MJX_GRAD_BACKEND`` is read at trace time, so already-compiled functions
   keep the backend they were traced with:
 
-  - unset or ``default``: the diff-mjx solver. With ``opt.scan_loop`` (the
-    default) the outer loop is a masked ``lax.scan`` that freezes after
-    convergence (reverse-mode compatible); otherwise ``lax.while_loop``.
+  - ``unrolled``: the diff-mjx solver, differentiated through its
+    iterations. With ``opt.scan_loop`` (the default) the outer loop is a
+    masked ``lax.scan`` that freezes after convergence (reverse-mode
+    compatible); otherwise ``lax.while_loop``.
   - ``while``: upstream ``lax.while_loop`` solver. Only reverse-mode compatible
     when ``m.opt.iterations == 1``.
   - ``scan``: fixed-depth unroll of exactly ``opt.iterations`` steps with no
     convergence check; differentiates through every step.
-  - ``ift``: implicit-function-theorem gradient via ``lax.custom_root``. The
-    forward value equals the ``while`` solve (computed with a masked scan);
-    the backward pass solves the adjoint of the stationarity residual with a
-    dense LU factorization. The gradient is that of the converged fixed
+  - unset or ``ift``: implicit-function-theorem gradient via
+    ``lax.custom_root``. The forward value equals the ``while`` solve
+    (computed with a masked scan); the backward pass solves the adjoint of
+    the stationarity residual with a dense LU factorization. The gradient is that of the converged fixed
     point, so it differs from the truncated solve when the forward solve
     stops before convergence (e.g. ``opt.iterations == 1``).
 

@@ -195,7 +195,7 @@ def grad_fn(mx, dx, kind, name, seed=0):
   return compile_with(name, jax.grad(loss), theta0)
 
 
-def check_step(mx, dx, kind, backends=('ift', 'scan', 'default'), seed=0,
+def check_step(mx, dx, kind, backends=('ift', 'scan', 'unrolled'), seed=0,
                fd_backend='while', fd_eps=FD_EPS) -> dict:
   """Single forward() gradient: each backend vs central FD and vs each other."""
   n = int(param_dim_mx(mx, kind))
@@ -274,7 +274,7 @@ def make_rollout_loss(mx, dx, horizon: int, seed: int = 0, substeps: int = 1):
   return loss, (horizon, nu)
 
 
-def check_rollout(mx, dx, horizon, backends=('ift', 'scan', 'default'),
+def check_rollout(mx, dx, horizon, backends=('ift', 'scan', 'unrolled'),
                   ndir=8, seed=0, fd_backend='while', fd_eps=FD_EPS,
                   substeps=1) -> dict:
   """Trajectory gradient vs directional central FD along random directions."""

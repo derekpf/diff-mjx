@@ -188,7 +188,7 @@ class SolverTest(parameterized.TestCase):
     m.opt.cone = cone
     solver.solve(mjx.put_model(m), mjx.put_data(m, mujoco.MjData(m)))
 
-  @parameterized.parameters('default', 'while')
+  @parameterized.parameters('ift', 'while')
   def test_backend_matches_unset(self, backend):
     m, d = self._load_constraints(
         mujoco.mjtSolver.mjSOL_NEWTON, mujoco.mjtCone.mjCONE_PYRAMIDAL
@@ -203,7 +203,7 @@ class SolverTest(parameterized.TestCase):
     _assert_eq(unset._impl.efc_force, other._impl.efc_force, 'efc_force')
 
   @parameterized.product(
-      backend=('default', 'while', 'scan', 'ift'),
+      backend=('unrolled', 'while', 'scan', 'ift'),
       cone=(mujoco.mjtCone.mjCONE_PYRAMIDAL, mujoco.mjtCone.mjCONE_ELLIPTIC),
   )
   def test_backend_matches_mujoco(self, backend, cone):
@@ -237,7 +237,7 @@ class SolverTest(parameterized.TestCase):
         solver.solve(mjx.put_model(m), mjx.put_data(m, d))
 
   @parameterized.product(
-      backend=('default', 'scan', 'ift'),
+      backend=('unrolled', 'scan', 'ift'),
       solver_=(
           mujoco.mjtSolver.mjSOL_NEWTON,
           mujoco.mjtSolver.mjSOL_CG,

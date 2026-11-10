@@ -25,7 +25,7 @@ import numpy as np
 # (validated: scripts in the dataviz skill, light surface).
 STYLE = {
     'scan': ('#2a78d6', 'o', 'Scan (unrolled)'),
-    'default': ('#eb6834', 's', 'Default (masked scan)'),
+    'unrolled': ('#eb6834', 's', 'Unrolled (masked scan)'),
     'ift_ref': ('#1baf7a', '^', 'Reference IFT'),
     'opt': ('#6250d6', 'D', 'Optimized IFT'),
 }
@@ -40,6 +40,10 @@ def load(results: pathlib.Path):
     for line in f.read_text().splitlines():
       r = json.loads(line)
       r['sweep'] = f.stem
+      # Rows recorded before the rename call the unrolled backend 'default'.
+      c = r.get('config', {})
+      if c.get('backend') == 'default':
+        c['backend'] = 'unrolled'
       rows.append(r)
   return rows
 
@@ -108,7 +112,7 @@ def main_table(g, opt):
     v = cand[0]
     base = v.get('ift_ref')
     for b, name in (('while', 'While (forward only)'), ('scan', 'Scan'),
-                    ('default', 'Default (masked scan)'),
+                    ('unrolled', 'Unrolled (masked scan)'),
                     ('ift_ref', 'Reference IFT'), (opt, 'Optimized IFT')):
       if b in v:
         lines.append(fmt_row(label, name, v[b], base))
@@ -183,7 +187,7 @@ def collect(g, sweep, scene, xfield, metric, opt, extra=None):
     if extra and not extra(kk):
       continue
     v = g[kk]
-    for sk, b in (('scan', 'scan'), ('default', 'default'),
+    for sk, b in (('scan', 'scan'), ('unrolled', 'unrolled'),
                   ('ift_ref', 'ift_ref'), ('opt', opt)):
       if b in v and 't_fb' in v[b]:
         out[sk][0].append(kk[idx])
@@ -258,7 +262,7 @@ def main():
   if tol_ref is not None:
     fig, ax = plt.subplots(figsize=(6.4, 4.0), dpi=150)
     fig.patch.set_facecolor(SURF)
-    for sk, b in (('scan', 'scan'), ('default', 'default'),
+    for sk, b in (('scan', 'scan'), ('unrolled', 'unrolled'),
                   ('ift_ref', 'ift_ref'), ('opt', opt)):
       xs, ys, ts = [], [], []
       for kk in sorted(g, key=lambda t: -t[5]):
