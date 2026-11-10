@@ -1,0 +1,56 @@
+{
+ "description": "G1JoystickFlatTerrain BPTT, forlax train_g1_shac.py env config (reward_softness=0.05, softjax_mode=smooth, pw_solimp=[0,0.8,1,1,10], contact_st_enable=True), 256 envs, horizon 16, opt.iterations=3, seed 0, float32, RTX 5080 shared with one other job. Times in ms (median of 10), memory = XLA temp bytes of the fused value_and_grad. Produced by g1_env_bench.py; \"remat\" = jax.remat(env.step, prevent_cse=False) as in forlax remat_enable.",
+ "runs": {
+  "default+remat": {
+   "t_f": 355.47999548725784,
+   "t_fb": 1767.2369020292535,
+   "t_b_dir": 1583.1026990199462,
+   "mem_fb": 1332463320,
+   "compile_fb": 113.38389735599048,
+   "grad_norm_median": 8028.57275390625,
+   "grad_nonfinite_alive_frac": 0.44081632653061226
+  },
+  "default (no remat)": {
+   "error": "out of memory: fused gradient needs ~19.25 GiB"
+  },
+  "ift": {
+   "t_f": 356.0582505306229,
+   "t_fb": 1026.7658754019067,
+   "t_b_dir": 359.3552145175636,
+   "mem_fb": 5761665952,
+   "compile_fb": 108.04715174413286,
+   "grad_norm_median": 7850.703125,
+   "grad_nonfinite_alive_frac": 0.42386831275720166
+  },
+  "ift+remat": {
+   "t_f": 355.3296608151868,
+   "t_fb": 1252.0870530279353,
+   "t_b_dir": 1071.3553950190544,
+   "mem_fb": 377516904,
+   "compile_fb": 103.78097179997712,
+   "grad_norm_median": 1689.31201171875,
+   "grad_nonfinite_alive_frac": 0.46502057613168724
+  }
+ },
+ "headroom_experiments": {
+  "note": "Solver patched at runtime; gradients of these runs are not valid, only their cost. identity_tangent replaces the matrix build + LU solve with y -> y (upper bound on tangent-solve optimizations); ckpt_solve wraps the ift solve in jax.checkpoint.",
+  "ift_identity_tangent": {
+   "t_f": 395.2569324756041,
+   "t_fb": 1004.6442769235,
+   "t_b_dir": 347.7426334284246,
+   "mem_fb": 5555540104,
+   "compile_fb": 92.93687163689174,
+   "grad_norm_median": NaN,
+   "grad_nonfinite_alive_frac": 1.0
+  },
+  "ift_ckpt_solve": {
+   "t_f": 355.9760580537841,
+   "t_fb": 1122.8015419328585,
+   "t_b_dir": 489.3359550042078,
+   "mem_fb": 4963487384,
+   "compile_fb": 111.8331278229598,
+   "grad_norm_median": 6358.91015625,
+   "grad_nonfinite_alive_frac": 0.4530612244897959
+  }
+ }
+}
