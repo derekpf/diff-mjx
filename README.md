@@ -110,6 +110,54 @@ inputs. These defaults stay unchanged.
 
 - **Shared sensor drop-ins.** Extends the shared softjax exports with the ST wrapper, selection, comparison, and safe-square-root operations required by these paths.
 
+- **Realised solver iterations.** Every solver backend writes the iteration count it actually ran to `Data._impl.solver_niter`.
+
+## Constraint-solver derivative backends
+
+The JAX constraint solver can be differentiated in several ways, selected by the `MJX_GRAD_BACKEND` environment variable. The forward physics (MJX's convex Gauss-principle solve, Newton or CG, pyramidal or elliptic cones) is the same for every backend; only the gradient differs. Ported from [calumarnott/mujoco](https://github.com/calumarnott/mujoco) (`3.9.0-derivatives`, Layeghi et al., [arXiv:2607.24959](https://arxiv.org/abs/2607.24959)) and adapted to this fork.
+
+| `MJX_GRAD_BACKEND` | forward loop | gradient |
+|---|---|---|
+| unset / `default` | masked scan (`opt.scan_loop=True`, freezes after convergence) or `while_loop` | unrolled through the iterations; unchanged diff-mjx behavior |
+| `while` | `lax.while_loop` | reverse mode only for `opt.iterations == 1` (upstream MJX) |
+| `scan` | exactly `opt.iterations` steps, no convergence check | unrolled through every step |
+| `ift` | masked scan, never differentiated | implicit function theorem on the stationarity residual |
+
+The variable is read when a function is **traced**, so set it before `jax.jit` traces (or compiles) the function; already-compiled functions keep their backend.
+
+**`ift` implementation.** At the solution, `F(a) = M a - qfrc_smooth - qfrc_constraint(a) = 0`. `lax.custom_root` runs the existing solver (`_root_iterative_solve`) to obtain `a*` without recording it for differentiation, then for the backward pass solves the adjoint system `(dF/da)^T λ = dL/da` and returns `-λ^T dF/dθ`, where `θ` is everything `F` depends on (state, controls, model parameters, constraint Jacobians and impedances, including any softjax/ST surrogates computed before the solve).
+
+- **Residual (`_root`).** Evaluates `F` directly from the constraint context. The reference built the full solver gradient update, including an unused Newton search-direction solve; XLA already eliminated that, so this change is for clarity only.
+- **Forward loop.** A masked scan instead of `lax.while_loop`: identical solution and iteration counts, but faster on GPU, where the while loop syncs to the host every iteration. Measured on batched 8-step rollouts (512 envs, shared RTX 5080, single runs), forward time dropped about 1.5x on G1 (19.5 to 12.8 ms at 3 iterations) and 1.6 to 1.9x on Go1 (3 to 10 iterations). Together with the LU tangent solve, total forward+backward time fell about 1.3x on G1 and 1.45x (3 iterations) to 2.3x (10 iterations) on Go1, relative to the reference port.
+- **Tangent solve (`_root_tangent_solve`).** Forms the `nv x nv` residual Jacobian by applying the linear map `custom_root` provides to the identity columns, then solves it with a dense LU factorization. The reference used `jax.jacobian` plus a QR factorization followed by a general solve on `R`; LU is as accurate in float32 and about 2.7x faster at `nv = 35`. `custom_root` transposes this solve in its right-hand side, so it must be exactly linear in it: iterative (CG-type) adjoint solves are not possible here and would need a `custom_vjp`.
+- **Outputs.** `qfrc_constraint` and `efc_force` are recomputed from `a*` with ordinary autodiff, so their gradients include both the implicit path through `a*` and the explicit dependence on `θ`. The warmstart only seeds the forward solve and receives no gradient.
+
+**What the gradient means.** `ift` differentiates the *converged* fixed point. When the forward solve stops short (small `opt.iterations`, loose `opt.tolerance`), its value is the truncated iterate but its gradient is that of the exact solution. Unrolled backends instead differentiate the iterations they ran. Measured in float64 against central finite differences (`mjx/benchmarks/ift_solver`):
+
+- **Converged solves.** `ift` matched finite differences (relative error 1e-9 to 1e-16) for every tested scene, cone, solver, and warmstart setting.
+- **Unrolled gradients drop or distort the solver sensitivity when:**
+  - the warmstart is already the solution (static or standing contact): the line search reports no improvement, and the masked update carries no derivative;
+  - the cone is elliptic: the last improving Newton step used the Hessian of a different cone zone (about 6% error, independent of the iteration count);
+  - the solver is CG: errors of 100% or more.
+- **Non-finite gradients from other sources are not affected.** In the G1 joystick environment, non-finite gradients occurred at similar rates under `default` and `ift`, so they originate outside the constraint-solver differentiation.
+
+**Cost.** The `ift` backward does one `nv x nv` matrix build, one LU solve, and one residual VJP per solve, independent of `opt.iterations`, and it stores no per-iteration residuals. Unrolled backward time and memory grow with the iteration count.
+
+Measured on BPTT through the diff-playground `G1JoystickFlatTerrain` environment, with forlax's G1 SHAC settings (256 envs, 16-step horizon, `pw_solimp` with `contact_st_enable`, 3 solver iterations, float32, one seed, RTX 5080):
+
+| backend | forward | backward | forward + backward | memory |
+|---|---:|---:|---:|---:|
+| `default`, no remat | – | – | out of memory (needs ~19 GiB) | – |
+| `default` + per-step remat | 355 ms | 1583 ms | 1767 ms | 1.33 GB |
+| `ift` + per-step remat | 355 ms | 1071 ms | 1252 ms (1.41x faster) | 0.38 GB |
+| `ift`, no remat | 356 ms | 359 ms | 1027 ms (1.72x faster) | 5.76 GB |
+
+Remat is `jax.remat(env.step, prevent_cse=False)`, as in forlax's `remat_enable`. The tangent solve (matrix build plus LU) is now about 3% of the `ift` backward; the rest is differentiating the environment itself. In this environment, about 45% of envs produced non-finite gradients over 16 steps under both `default` and `ift`.
+
+Benchmarks, validation scripts, raw results, and reproduction commands are in [`mjx/benchmarks/ift_solver`](mjx/benchmarks/ift_solver/README.md).
+
+**Tests.** `mjx/mujoco/mjx/_src/solver_test.py` (backend selection and forward equivalence against MuJoCo C) and `mjx/mujoco/mjx/_src/solver_grad_test.py` (gradients against unrolled differentiation and finite differences).
+
 <h1>
   <a href="#"><img alt="MuJoCo" src="banner.png" width="100%"/></a>
 </h1>

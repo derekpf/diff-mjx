@@ -346,7 +346,8 @@ def plane_convex(
                   standardize=False, gated_grad=False,
                   st_enable=st_enable)  # Pick vertex with largest penetration.
     thresh = sj.relu(
-        smax - 1e-3, softness=softness, mode=m, st_enable=st_enable
+        smax - 1e-3, softness=softness, mode=m, st_enable=st_enable,
+        gated=False,
     )  # If (smax - 1e-3) > 0 use it to select contact points.                           │
     poly_mask = sj.greater(support,
                            thresh,

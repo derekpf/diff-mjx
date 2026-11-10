@@ -14,9 +14,13 @@
 # ==============================================================================
 """Tests for constraint functions."""
 
+import os
+from unittest import mock
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+from jax import numpy as jp
 import mujoco
 from mujoco import mjx
 from mujoco.mjx._src import solver
@@ -30,6 +34,14 @@ import numpy as np
 _TOLERANCE = 5e-3
 
 
+def _solve_with_backend(backend, mx, dx):
+  env = {} if backend is None else {'MJX_GRAD_BACKEND': backend}
+  with mock.patch.dict(os.environ, env, clear=False):
+    if backend is None:
+      os.environ.pop('MJX_GRAD_BACKEND', None)
+    return jax.jit(lambda m, d: mjx.solve(m, d))(mx, dx)
+
+
 def _assert_eq(a, b, name, tol=_TOLERANCE):
   tol = tol * 10  # avoid test noise
   err_msg = f'mismatch: {name}'
@@ -41,6 +53,18 @@ def _assert_attr_eq(a, b, attr, tol=_TOLERANCE):
 
 
 class SolverTest(parameterized.TestCase):
+
+  def _load_constraints(self, solver_, cone, iterations=4):
+    m = test_util.load_test_file('constraints.xml')
+    m.opt.solver = solver_
+    m.opt.cone = cone
+    m.opt.iterations = iterations
+    if iterations < 5:
+      m.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_ISLAND
+    d = mujoco.MjData(m)
+    mujoco.mj_resetDataKeyframe(m, d, 2)
+    mujoco.mj_forward(m, d)
+    return m, d
 
   @parameterized.parameters(
       # these scene challenges the solver, with CG you need to crank up
@@ -163,6 +187,94 @@ class SolverTest(parameterized.TestCase):
     """)
     m.opt.cone = cone
     solver.solve(mjx.put_model(m), mjx.put_data(m, mujoco.MjData(m)))
+
+  @parameterized.parameters('default', 'while')
+  def test_backend_matches_unset(self, backend):
+    m, d = self._load_constraints(
+        mujoco.mjtSolver.mjSOL_NEWTON, mujoco.mjtCone.mjCONE_PYRAMIDAL
+    )
+    mx, dx = mjx.put_model(m), mjx.put_data(m, d)
+
+    unset = _solve_with_backend(None, mx, dx)
+    other = _solve_with_backend(backend, mx, dx)
+
+    _assert_attr_eq(unset, other, 'qacc')
+    _assert_attr_eq(unset, other, 'qfrc_constraint')
+    _assert_eq(unset._impl.efc_force, other._impl.efc_force, 'efc_force')
+
+  @parameterized.product(
+      backend=('default', 'while', 'scan', 'ift'),
+      cone=(mujoco.mjtCone.mjCONE_PYRAMIDAL, mujoco.mjtCone.mjCONE_ELLIPTIC),
+  )
+  def test_backend_matches_mujoco(self, backend, cone):
+    """Every backend reproduces MuJoCo C at a converged Newton solve."""
+    m, d = self._load_constraints(mujoco.mjtSolver.mjSOL_NEWTON, cone, 10)
+    mx = mjx.put_model(m)
+    # MJX does not support islanding; give C the same non-island problem.
+    m.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_ISLAND
+    mujoco.mj_forward(m, d)
+    dx = mjx.put_data(m, d).replace(qacc=d.qacc_warmstart)
+
+    out = _solve_with_backend(backend, mx, dx)
+    ref = _solve_with_backend('while', mx, dx)
+
+    _assert_attr_eq(out, d, 'qacc')
+    if cone == mujoco.mjtCone.mjCONE_PYRAMIDAL:
+      # For elliptic cones on this scene, one qfrc_constraint entry differs
+      # from C by ~10% for every backend (pre-existing MJX behaviour).
+      _assert_attr_eq(out, d, 'qfrc_constraint')
+    _assert_attr_eq(out, ref, 'qfrc_constraint')
+    _assert_eq(out._impl.efc_force, ref._impl.efc_force, 'efc_force')
+    self.assertGreater(int(out._impl.solver_niter), 0)
+
+  def test_invalid_backend(self):
+    m, d = self._load_constraints(
+        mujoco.mjtSolver.mjSOL_NEWTON, mujoco.mjtCone.mjCONE_PYRAMIDAL
+    )
+
+    with mock.patch.dict(os.environ, {'MJX_GRAD_BACKEND': 'not-a-backend'}):
+      with self.assertRaisesRegex(ValueError, 'MJX_GRAD_BACKEND'):
+        solver.solve(mjx.put_model(m), mjx.put_data(m, d))
+
+  @parameterized.product(
+      backend=('default', 'scan', 'ift'),
+      solver_=(
+          mujoco.mjtSolver.mjSOL_NEWTON,
+          mujoco.mjtSolver.mjSOL_CG,
+      ),
+      cone=(
+          mujoco.mjtCone.mjCONE_PYRAMIDAL,
+          mujoco.mjtCone.mjCONE_ELLIPTIC,
+      ),
+  )
+  def test_backend_reverse_mode(self, backend, solver_, cone):
+    m, d = self._load_constraints(solver_, cone)
+    mx, dx = mjx.put_model(m), mjx.put_data(m, d)
+    weights = jp.linspace(0.1, 1.0, dx.qacc.shape[0])
+
+    with mock.patch.dict(os.environ, {'MJX_GRAD_BACKEND': backend}):
+
+      def loss(qfrc_smooth):
+        dy = mjx.solve(mx, dx.replace(qfrc_smooth=qfrc_smooth))
+        return jp.dot(weights, dy.qacc)
+
+      grad = jax.jit(jax.grad(loss))(dx.qfrc_smooth)
+      grad.block_until_ready()
+
+    self.assertTrue(np.all(np.isfinite(grad)))
+
+  def test_ift_no_warmstart(self):
+    m, d = self._load_constraints(
+        mujoco.mjtSolver.mjSOL_NEWTON, mujoco.mjtCone.mjCONE_PYRAMIDAL
+    )
+    m.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_WARMSTART
+    mx, dx = mjx.put_model(m), mjx.put_data(m, d)
+
+    out = _solve_with_backend('ift', mx, dx)
+
+    self.assertTrue(np.all(np.isfinite(out.qacc)))
+    self.assertTrue(np.all(np.isfinite(out.qfrc_constraint)))
+    self.assertTrue(np.all(np.isfinite(out._impl.efc_force)))
 
 
 if __name__ == '__main__':

@@ -14,6 +14,8 @@
 # ==============================================================================
 """Constraint solvers."""
 
+import os
+
 import jax
 from jax import numpy as jp
 import mujoco
@@ -423,6 +425,56 @@ def _rescale(m: Model, value: jax.Array) -> jax.Array:
   return value / (m.stat.meaninertia * max(1, m.nv))
 
 
+def _solver_done(m: Model, ctx: Context) -> jax.Array:
+  improvement = _rescale(m, ctx.prev_cost - ctx.cost)
+  gradient = _rescale(m, math.norm(ctx.grad))
+
+  done = ctx.solver_niter >= m.opt.iterations
+  done |= improvement < m.opt.tolerance
+  done |= gradient < m.opt.tolerance
+
+  return done
+
+
+def _solver_step(m: Model, d: Data, ctx: Context) -> Context:
+  ctx = _linesearch(m, d, ctx)
+  prev_grad, prev_Mgrad = ctx.grad, ctx.Mgrad  # pylint: disable=invalid-name
+  ctx = _update_constraint(m, d, ctx)
+  ctx = _update_gradient(m, d, ctx)
+
+  if m.opt.solver == SolverType.NEWTON:
+    search = -ctx.Mgrad
+  else:
+    # polak-ribiere:
+    beta = jp.dot(ctx.grad, ctx.Mgrad - prev_Mgrad)
+    beta = beta / jp.maximum(mujoco.mjMINVAL, jp.dot(prev_grad, prev_Mgrad))
+    beta = jp.maximum(0, beta)
+    search = -ctx.Mgrad + beta * ctx.search
+  ctx = ctx.replace(search=search, solver_niter=ctx.solver_niter + 1)
+
+  return ctx
+
+
+def _warmstart_qacc(m: Model, d: Data) -> jax.Array:
+  qacc = d.qacc_smooth
+  if not m.opt.disableflags & DisableBit.WARMSTART:
+    warm = Context.create(m, d.replace(qacc=d.qacc_warmstart), grad=False)
+    smth = Context.create(m, d.replace(qacc=d.qacc_smooth), grad=False)
+    qacc = jp.where(warm.cost < smth.cost, d.qacc_warmstart, d.qacc_smooth)
+
+  return qacc
+
+
+def _finish_solve(d: Data, ctx: Context) -> Data:
+  solver_niter = jp.asarray(ctx.solver_niter).astype(d._impl.solver_niter.dtype)
+  return d.tree_replace({
+      'qfrc_constraint': ctx.qfrc_constraint,
+      'qacc': ctx.qacc,
+      '_impl.efc_force': ctx.efc_force,
+      '_impl.solver_niter': solver_niter,
+  })
+
+
 def _linesearch(m: Model, d: Data, ctx: Context) -> Context:
   """Performs a zoom linesearch to find optimal search step size.
 
@@ -558,60 +610,173 @@ def _linesearch(m: Model, d: Data, ctx: Context) -> Context:
   return ctx
 
 
-def solve(m: Model, d: Data) -> Data:
-  """Finds forces that satisfy constraints using conjugate gradient descent."""
+def _check_jax_impl(m: Model):
   if not isinstance(m.opt._impl, OptionJAX):
     raise ValueError('solve requires JAX backend implementation.')
 
+
+def _solve_default(m: Model, d: Data) -> Data:
+  """diff-mjx solver: masked scan if ``opt.scan_loop``, else while loop."""
+  _check_jax_impl(m)
+
   def cond(ctx: Context) -> jax.Array:
-    improvement = _rescale(m, ctx.prev_cost - ctx.cost)
-    gradient = _rescale(m, math.norm(ctx.grad))
-
-    done = ctx.solver_niter >= m.opt.iterations
-    done |= improvement < m.opt.tolerance
-    done |= gradient < m.opt.tolerance
-
-    return ~done
+    return ~_solver_done(m, ctx)
 
   def body(ctx: Context) -> Context:
-    ctx = _linesearch(m, d, ctx)
-    prev_grad, prev_Mgrad = ctx.grad, ctx.Mgrad  # pylint: disable=invalid-name
-    ctx = _update_constraint(m, d, ctx)
-    ctx = _update_gradient(m, d, ctx)
+    return _solver_step(m, d, ctx)
 
-    if m.opt.solver == SolverType.NEWTON:
-      search = -ctx.Mgrad
-    else:
-      # polak-ribiere:
-      beta = jp.dot(ctx.grad, ctx.Mgrad - prev_Mgrad)
-      beta = beta / jp.maximum(mujoco.mjMINVAL, jp.dot(prev_grad, prev_Mgrad))
-      beta = jp.maximum(0, beta)
-      search = -ctx.Mgrad + beta * ctx.search
-    ctx = ctx.replace(search=search, solver_niter=ctx.solver_niter + 1)
+  d = d.replace(qacc=_warmstart_qacc(m, d))
 
-    return ctx
+  ctx = Context.create(m, d)
+  if m.opt.iterations == 1:
+    ctx = body(ctx)
+  elif m.opt.scan_loop:
+    ctx = _while_loop_scan(cond, body, ctx, max_iter=m.opt.iterations)
+  else:
+    ctx = jax.lax.while_loop(cond, body, ctx)
 
-  # warmstart:
-  qacc = d.qacc_smooth
-  if not m.opt.disableflags & DisableBit.WARMSTART:
-    warm = Context.create(m, d.replace(qacc=d.qacc_warmstart), grad=False)
-    smth = Context.create(m, d.replace(qacc=d.qacc_smooth), grad=False)
-    qacc = jp.where(warm.cost < smth.cost, d.qacc_warmstart, d.qacc_smooth)
-  d = d.replace(qacc=qacc)
+  return _finish_solve(d, ctx)
+
+
+def _solve_while(m: Model, d: Data) -> Data:
+  """Finds forces that satisfy constraints using a while loop."""
+  _check_jax_impl(m)
+
+  def cond(ctx: Context) -> jax.Array:
+    return ~_solver_done(m, ctx)
+
+  def body(ctx: Context) -> Context:
+    return _solver_step(m, d, ctx)
+
+  d = d.replace(qacc=_warmstart_qacc(m, d))
 
   ctx = Context.create(m, d)
   if m.opt.iterations == 1:
     ctx = body(ctx)
   else:
-    if m.opt.scan_loop:
-      ctx = _while_loop_scan(cond, body, ctx, max_iter=m.opt.iterations)
-    else:
-      ctx = jax.lax.while_loop(cond, body, ctx)
+    ctx = jax.lax.while_loop(cond, body, ctx)
 
-  d = d.tree_replace({
-      'qfrc_constraint': ctx.qfrc_constraint,
-      'qacc': ctx.qacc,
-      '_impl.efc_force': ctx.efc_force,
-  })
+  return _finish_solve(d, ctx)
 
-  return d
+
+def _solve_scan(m: Model, d: Data) -> Data:
+  """Finds forces using an unrolled scan with reverse-mode support."""
+  _check_jax_impl(m)
+
+  d = d.replace(qacc=_warmstart_qacc(m, d))
+  ctx = Context.create(m, d)
+
+  def body(ctx: Context, _) -> tuple[Context, None]:
+    return _solver_step(m, d, ctx), None
+
+  ctx, _ = jax.lax.scan(body, ctx, None, length=m.opt.iterations)
+
+  return _finish_solve(d, ctx)
+
+
+def _root(m: Model, d: Data, qacc: jax.Array) -> jax.Array:
+  """Stationarity residual ``M qacc - qfrc_smooth - qfrc_constraint``."""
+  ctx = Context.create(m, d.replace(qacc=qacc), grad=False)
+  return ctx.Ma - d.qfrc_smooth - ctx.qfrc_constraint
+
+
+def _root_iterative_solve(
+    m: Model, d: Data, qacc: jax.Array
+) -> tuple[jax.Array, jax.Array]:
+  """Runs the solver to convergence; returns (qacc, realised iterations).
+
+  This solve is never differentiated, so it uses the masked scan rather than
+  ``lax.while_loop``, which is slow on GPU; results and iteration counts are
+  identical to the while loop.
+  """
+  d = d.replace(qacc=qacc)
+  ctx = Context.create(m, d)
+
+  def cond(ctx: Context) -> jax.Array:
+    return ~_solver_done(m, ctx)
+
+  def body(ctx: Context) -> Context:
+    return _solver_step(m, d, ctx)
+
+  if m.opt.iterations == 1:
+    ctx = body(ctx)
+  else:
+    ctx = _while_loop_scan(cond, body, ctx, max_iter=m.opt.iterations)
+
+  # Float, not int: custom_root's JVP gives integer aux outputs an integer
+  # tangent, which JAX rejects (integer tangents must be float0).
+  return ctx.qacc, jp.asarray(ctx.solver_niter, dtype=qacc.dtype)
+
+
+def _root_tangent_solve(g, y):
+  """Solves ``g(x) = y`` for the linear map ``g`` of the residual Jacobian.
+
+  ``custom_root`` reverse-differentiates by transposing this function in
+  ``y``, so it must be exactly linear in ``y`` (rules out iterative solves).
+  """
+  # g is linear, so applying it to the identity columns gives its matrix.
+  eye = jp.eye(y.shape[0], dtype=y.dtype)
+  a = jax.vmap(g, out_axes=1)(eye)
+  return jp.linalg.solve(a, y)
+
+
+def _solve_ift(m: Model, d: Data) -> Data:
+  """Finds forces using a custom-root implicit gradient."""
+  _check_jax_impl(m)
+
+  qacc_guess = _warmstart_qacc(m, d)
+  root = lambda qacc: _root(m, d, qacc)
+  solve_root = lambda _, qacc: _root_iterative_solve(m, d, qacc)
+  # The iteration count is auxiliary output (not differentiated) so callers
+  # can see how many iterations the forward solve actually needed.
+  qacc, solver_niter = jax.lax.custom_root(
+      root, qacc_guess, solve_root, _root_tangent_solve, has_aux=True
+  )
+  d = d.replace(qacc=qacc)
+  ctx = Context.create(m, d, grad=False).replace(solver_niter=solver_niter)
+
+  return _finish_solve(d, ctx)
+
+
+_BACKENDS = {
+    'default': _solve_default,
+    'while': _solve_while,
+    'scan': _solve_scan,
+    'ift': _solve_ift,
+}
+
+
+def grad_backend() -> str:
+  """Returns the solver backend selected by ``MJX_GRAD_BACKEND``."""
+  backend = os.environ.get('MJX_GRAD_BACKEND', '').strip().lower() or 'default'
+  if backend not in _BACKENDS:
+    raise ValueError(
+        f'unsupported MJX_GRAD_BACKEND={backend!r}; expected one of '
+        f'{", ".join(_BACKENDS)}'
+    )
+  return backend
+
+
+def solve(m: Model, d: Data) -> Data:
+  """Finds constraint forces, selecting the solver via ``MJX_GRAD_BACKEND``.
+
+  ``MJX_GRAD_BACKEND`` is read at trace time, so already-compiled functions
+  keep the backend they were traced with:
+
+  - unset or ``default``: the diff-mjx solver. With ``opt.scan_loop`` (the
+    default) the outer loop is a masked ``lax.scan`` that freezes after
+    convergence (reverse-mode compatible); otherwise ``lax.while_loop``.
+  - ``while``: upstream ``lax.while_loop`` solver. Only reverse-mode compatible
+    when ``m.opt.iterations == 1``.
+  - ``scan``: fixed-depth unroll of exactly ``opt.iterations`` steps with no
+    convergence check; differentiates through every step.
+  - ``ift``: implicit-function-theorem gradient via ``lax.custom_root``. The
+    forward value equals the ``while`` solve (computed with a masked scan);
+    the backward pass solves the adjoint of the stationarity residual with a
+    dense LU factorization. The gradient is that of the converged fixed
+    point, so it differs from the truncated solve when the forward solve
+    stops before convergence (e.g. ``opt.iterations == 1``).
+
+  For every backend the line search loop is selected by ``opt.scan_loop``.
+  """
+  return _BACKENDS[grad_backend()](m, d)
