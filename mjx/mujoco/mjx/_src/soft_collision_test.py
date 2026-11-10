@@ -263,7 +263,7 @@ class SoftCollisionTest(parameterized.TestCase):
     # These fixtures lie inside a smoothing band.  Other fixtures can have
     # identical hard and soft values, especially with compact C2 smoothing.
     if mode == 'smooth' and name in (
-        'plane_box', 'plane_capsule', 'plane_cylinder_parallel',
+        'plane_capsule', 'plane_cylinder_parallel',
         'sphere_sphere', 'sphere_sphere_coincident', 'sphere_capsule', 'box_box'
     ):
       self.assertTrue(any(not np.allclose(a, b, atol=1e-5, rtol=1e-5)
@@ -649,6 +649,105 @@ class SoftCollisionTest(parameterized.TestCase):
       np.testing.assert_allclose(grad, 0)
     else:
       self.assertFalse(np.allclose(grad, 0), f'{name} gradient is all zero')
+
+
+_PLANE_FOOT_XML = """
+<mujoco>
+  <option timestep="0.002"/>
+  <worldbody>
+    <geom type="plane" size="5 5 0.1"/>
+    <body>
+      <freejoint/>
+      <geom type="box" size="0.09 0.03 0.008" mass="1"/>
+    </body>
+  </worldbody>
+</mujoco>
+"""
+_FOOT_HALF_DIAGONAL = float(np.linalg.norm([0.09, 0.03, 0.008]))
+
+# (name, base position, base rotation vector, away from a selection switch)
+_PLANE_FOOT_POSES = (
+    # Flat faces tie four vertices; the selection sits on its boundary.
+    ('flat_separated', (0.0, 0.0, 0.010), (0.0, 0.0, 0.0), False),
+    ('flat_touching', (0.0, 0.0, 0.0075), (0.0, 0.0, 0.0), False),
+    # One corner lower than the next by about half the 1 mm skin depth.
+    ('near_skin_separated', (0.0, 0.0, 0.015), (0.0, 0.003, 0.0), False),
+    ('tilted_separated', (0.0, 0.0, 0.030), (0.2, 0.15, 0.0), True),
+    ('tilted_penetrating', (0.0, 0.0, 0.0), (0.1, 0.05, 0.3), True),
+    # G1 foot poses from BPTT start states where the softened selection gave
+    # separated-corner distance gradients of 4.2e5 and 9.7e3.
+    ('g1_foot_separated_a', (0.160048, 0.182236, 0.013663),
+     (-0.150310, 0.019678, -0.078383), False),
+    ('g1_foot_separated_b', (-0.311898, -0.295498, 0.013686),
+     (-0.102583, 0.045034, -1.440415), False),
+)
+
+
+class PlaneConvexGradientTest(parameterized.TestCase):
+  """plane_convex selection is hard, so distances keep geometric gradients."""
+
+  def _dist_fn(self, mode, st_enable, pos0, rot0):
+    m = mujoco.MjModel.from_xml_string(_PLANE_FOOT_XML)
+    mx = mjx.put_model(m)
+    mx = mx.replace(opt=mx.opt.replace(
+        softjax_mode=mode, contact_st_enable=st_enable, pw_solimp=None
+    ))
+    dx = mjx.put_data(m, mujoco.MjData(m))
+    rot0 = np.asarray(rot0, dtype=float)
+    angle = np.linalg.norm(rot0)
+    axis = rot0 / angle if angle > 0 else np.array([1.0, 0.0, 0.0])
+    quat0 = math.axis_angle_to_quat(jp.asarray(axis), angle)
+
+    def dist(x):
+      # x = (translation, rotation vector) perturbation about the base pose;
+      # at x = 0 the rotation map has unit Lipschitz constant.
+      dq = math.normalize(jp.concatenate([jp.ones(1), 0.5 * x[3:]]))
+      qpos = jp.concatenate([jp.asarray(pos0) + x[:3],
+                             math.quat_mul(quat0, dq)])
+      data = smooth.kinematics(mx, dx.replace(qpos=qpos))
+      data = smooth.com_pos(mx, data)
+      return collision_driver.collision(mx, data)._impl.contact.dist
+
+    return dist
+
+  @parameterized.product(
+      pose=_PLANE_FOOT_POSES,
+      mode=('smooth', 'c2'),
+      st_enable=(False, True),
+  )
+  def test_forward_matches_hard_and_gradients_are_geometric(
+      self, pose, mode, st_enable
+  ):
+    name, pos0, rot0, away_from_switch = pose
+    x0 = jp.zeros(6)
+    hard_fn = self._dist_fn('hard', False, pos0, rot0)
+    dist_fn = self._dist_fn(mode, st_enable, pos0, rot0)
+
+    hard = np.asarray(jax.jit(hard_fn)(x0))
+    dist = np.asarray(jax.jit(dist_fn)(x0))
+    np.testing.assert_allclose(dist, hard, atol=1e-6, err_msg=name)
+
+    jac = np.asarray(jax.jit(jax.jacrev(dist_fn))(x0))  # (ncon, 6)
+    self.assertTrue(np.all(np.isfinite(jac)), name)
+    active = hard < 0.5  # the others hold the 1.0 no-contact value
+    self.assertTrue(np.any(active), name)
+    np.testing.assert_allclose(jac[~active], 0.0, err_msg=name)
+    trans = np.linalg.norm(jac[active, :3], axis=-1)
+    rot = np.linalg.norm(jac[active, 3:], axis=-1)
+    self.assertTrue(np.all(trans <= 1.0 + 1e-4), f'{name}: {trans}')
+    self.assertTrue(
+        np.all(rot <= _FOOT_HALF_DIAGONAL + 1e-4), f'{name}: {rot}'
+    )
+
+    if away_from_switch:
+      eps = 1e-3
+      fd = np.stack([
+          (np.asarray(hard_fn(x0.at[i].set(eps)))
+           - np.asarray(hard_fn(x0.at[i].set(-eps)))) / (2 * eps)
+          for i in range(6)
+      ], axis=-1)
+      np.testing.assert_allclose(jac[active], fd[active], atol=2e-3,
+                                 err_msg=name)
 
 
 if __name__ == '__main__':

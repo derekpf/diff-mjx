@@ -99,21 +99,7 @@ def run_test(name, xml, expect_zero_grad=False, skip_grad=False):
 # Test models — one per collision pair we've softened
 # ============================================================
 
-# 1. plane_box (plane_convex) — original test
-PLANE_BOX_XML = """
-<mujoco>
-  <option timestep="0.002"/>
-  <worldbody>
-    <geom type="plane" size="5 5 0.1"/>
-    <body pos="0 0 0.5">
-      <freejoint/>
-      <geom type="box" size="0.1 0.1 0.1" mass="1"/>
-    </body>
-  </worldbody>
-</mujoco>
-"""
-
-# 2. plane_sphere
+# 1. plane_sphere
 PLANE_SPHERE_XML = """
 <mujoco>
   <option timestep="0.002"/>
@@ -127,7 +113,7 @@ PLANE_SPHERE_XML = """
 </mujoco>
 """
 
-# 3. plane_capsule
+# 2. plane_capsule
 PLANE_CAPSULE_XML = """
 <mujoco>
   <option timestep="0.002"/>
@@ -141,7 +127,7 @@ PLANE_CAPSULE_XML = """
 </mujoco>
 """
 
-# 4. plane_ellipsoid
+# 3. plane_ellipsoid
 PLANE_ELLIPSOID_XML = """
 <mujoco>
   <option timestep="0.002"/>
@@ -155,7 +141,7 @@ PLANE_ELLIPSOID_XML = """
 </mujoco>
 """
 
-# 5. plane_cylinder
+# 4. plane_cylinder
 PLANE_CYLINDER_XML = """
 <mujoco>
   <option timestep="0.002"/>
@@ -169,7 +155,7 @@ PLANE_CYLINDER_XML = """
 </mujoco>
 """
 
-# 6. sphere_sphere
+# 5. sphere_sphere
 SPHERE_SPHERE_XML = """
 <mujoco>
   <option timestep="0.002"/>
@@ -186,7 +172,7 @@ SPHERE_SPHERE_XML = """
 </mujoco>
 """
 
-# 7. sphere_capsule
+# 6. sphere_capsule
 SPHERE_CAPSULE_XML = """
 <mujoco>
   <option timestep="0.002"/>
@@ -203,7 +189,7 @@ SPHERE_CAPSULE_XML = """
 </mujoco>
 """
 
-# 8. capsule_capsule
+# 7. capsule_capsule
 CAPSULE_CAPSULE_XML = """
 <mujoco>
   <option timestep="0.002"/>
@@ -220,7 +206,7 @@ CAPSULE_CAPSULE_XML = """
 </mujoco>
 """
 
-# 9. plane_cylinder (axis nearly parallel to plane — exercises the prjaxis~0 branch)
+# 8. plane_cylinder (axis nearly parallel to plane — exercises the prjaxis~0 branch)
 PLANE_CYLINDER_PARALLEL_XML = """
 <mujoco>
   <option timestep="0.002"/>
@@ -234,7 +220,7 @@ PLANE_CYLINDER_PARALLEL_XML = """
 </mujoco>
 """
 
-# 10. sphere_sphere (coincident — exercises the dist==0 fallback)
+# 9. sphere_sphere (coincident — exercises the dist==0 fallback)
 SPHERE_SPHERE_COINCIDENT_XML = """
 <mujoco>
   <option timestep="0.002"/>
@@ -251,7 +237,7 @@ SPHERE_SPHERE_COINCIDENT_XML = """
 </mujoco>
 """
 
-# 11. capsule_capsule (parallel — exercises segment-to-segment edge case)
+# 10. capsule_capsule (parallel — exercises segment-to-segment edge case)
 #     Capsules separated enough that MuJoCo C finds <=1 contact,
 #     but close enough that MJX exercises the parallel segment path.
 CAPSULE_CAPSULE_PARALLEL_XML = """
@@ -274,7 +260,6 @@ CAPSULE_CAPSULE_PARALLEL_XML = """
 # Run all tests
 # ============================================================
 
-run_test("plane_box (plane_convex)", PLANE_BOX_XML)
 run_test("plane_sphere", PLANE_SPHERE_XML)
 run_test("plane_capsule", PLANE_CAPSULE_XML)
 run_test("plane_ellipsoid", PLANE_ELLIPSOID_XML)

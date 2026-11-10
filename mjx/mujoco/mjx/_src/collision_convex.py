@@ -328,11 +328,20 @@ def plane_convex(
     convex: ConvexInfo,
     soft: bool,
     softjax_mode: Optional[str],
-    softness: float = 1e-6,
     *,
     st_enable: bool = False,
 ) -> Collision:
-  """Calculates contacts between a plane and a convex object."""
+  """Calculates contacts between a plane and a convex object.
+
+  Contact-point selection is always hard, for every ``softjax_mode`` and
+  ``st_enable``: gradients flow only through the geometry of the selected
+  vertices. Softening the selection (deepest vertex, 1 mm skin threshold,
+  manifold choice, duplicate gate) gave no usable gradient. Its surrogate
+  derivatives scale with the inverse softness near selection boundaries, which
+  flat faces with tied vertices sit on, and blend distances with the 1.0
+  no-contact value. Separated vertices' distance gradients reached ~1e5.
+  """
+  del soft, softjax_mode, st_enable  # Selection is not softened; see above.
   vert = convex.vert
 
   # get points in the convex frame
@@ -340,44 +349,12 @@ def plane_convex(
   n = convex.mat.T @ plane.mat[:, 2]
   support = (plane_pos - vert) @ n
 
-  if soft:
-    m = softjax_mode
-    smax = sj.max(support, softness=softness, mode=m,
-                  standardize=False, gated_grad=False,
-                  st_enable=st_enable)  # Pick vertex with largest penetration.
-    thresh = sj.relu(
-        smax - 1e-3, softness=softness, mode=m, st_enable=st_enable,
-        gated=False,
-    )  # If (smax - 1e-3) > 0 use it to select contact points.                           │
-    poly_mask = sj.greater(support,
-                           thresh,
-                           softness=softness,
-                           mode=m,
-                           st_enable=st_enable)
-    idx = _manifold_points_soft(vert,
-                                poly_mask,
-                                n,
-                                mode=m,
-                                softness=softness,
-                                st_enable=st_enable)
-    pos = idx @ vert  # (4, N) @ (N, 3) → (4, 3)                                           │
-    dist = -(idx @ support)  # (4, N) @ (N,) → (4,)
-    # Nominal MJX keeps only the first occurrence of a manifold vertex.  The
-    # soft overlap gate relaxes that operation; ST uses its nominal 0/1 value.
-    previous = jp.tril(idx @ idx.T, k=-1).sum(axis=1)
-    unique = sj.less(previous,
-                     0.5,
-                     softness=softness,
-                     mode=m,
-                     st_enable=st_enable)
-    dist = sj.where(unique, dist, 1.0)
-  else:
-    # search for manifold points within a 1mm skin depth
-    idx = _manifold_points(vert, support > jp.maximum(0, support.max() - 1e-3), n)
-    pos = vert[idx]
-    dist = -support[idx]
-    unique = jp.tril(idx == idx[:, None]).sum(axis=1) == 1
-    dist = jp.where(unique, dist, 1)
+  # search for manifold points within a 1mm skin depth
+  idx = _manifold_points(vert, support > jp.maximum(0, support.max() - 1e-3), n)
+  pos = vert[idx]
+  dist = -support[idx]
+  unique = jp.tril(idx == idx[:, None]).sum(axis=1) == 1
+  dist = jp.where(unique, dist, 1)
 
   # convert to world frame
   pos = convex.pos + pos @ convex.mat.T
