@@ -301,38 +301,150 @@ def _activeset_softnesses(m: Model) -> tuple[float, float, float]:
   return tuple(softnesses)
 
 
-def _activeset_refinement_iters(m: Model) -> int:
-  """Returns the validated ``opt.activeset_refinement_iters`` (static int >= 0)."""
-  value = m.opt.activeset_refinement_iters
+def _static_count_option(m: Model, name: str) -> int:
+  """Returns the validated static int option ``opt.<name>`` (>= 0)."""
+  value = getattr(m.opt, name)
   if isinstance(value, (bool, jax.Array)) or not isinstance(
       value, numbers.Integral
   ):
     raise TypeError(
-        'opt.activeset_refinement_iters must be a Python int, got '
-        f'{value!r}; it is static and sets a loop length at trace time.'
+        f'opt.{name} must be a Python int, got {value!r}; it is static and '
+        'sets a loop length at trace time.'
     )
   if value < 0:
-    raise ValueError(
-        f'opt.activeset_refinement_iters must be >= 0, got {value}.'
-    )
+    raise ValueError(f'opt.{name} must be >= 0, got {value}.')
   return int(value)
 
 
-def _refine_smoothed_root(root, qacc_hard: jax.Array, iters: int) -> jax.Array:
-  """Newton iterations from the hard solution toward the smoothed residual's root.
+def _refinement_iterations(m: Model) -> int:
+  """Returns the validated ``opt.refinement_iterations`` (static int >= 0)."""
+  return _static_count_option(m, 'refinement_iterations')
 
-  The result is only the gradient's evaluation point; forward values stay hard.
-  Safeguard: if the iterations do not reduce the smoothed residual (or produce
-  non-finite values), the hard solution is kept.
+
+def _refinement_ls_iterations(m: Model) -> int:
+  """Returns the validated ``opt.refinement_ls_iterations``.
+
+  Mirrors ``opt.ls_iterations`` for the refinement's smoothed line search.
+  0 disables the line search (plain Newton, full steps).
+  """
+  return _static_count_option(m, 'refinement_ls_iterations')
+
+
+def _refinement_tolerance(m: Model) -> float:
+  """Returns the validated ``opt.refinement_tolerance`` (static float >= 0)."""
+  value = m.opt.refinement_tolerance
+  if isinstance(value, (bool, jax.Array)) or not isinstance(value, numbers.Real):
+    raise TypeError(
+        f'opt.refinement_tolerance must be a Python float, got {value!r}; '
+        'it is static.'
+    )
+  tolerance = float(value)
+  if not (tolerance >= 0.0 and tolerance < float('inf')):
+    raise ValueError(
+        f'opt.refinement_tolerance must be finite and >= 0, got {tolerance}.'
+    )
+  return tolerance
+
+
+def _refinement_fallback_enable(m: Model) -> bool:
+  """Returns the validated ``opt.refinement_fallback_enable`` (static bool)."""
+  value = m.opt.refinement_fallback_enable
+  if not isinstance(value, bool):
+    raise TypeError(
+        'opt.refinement_fallback_enable must be a Python bool, got '
+        f'{value!r}; it is static.'
+    )
+  return value
+
+
+
+
+def _smoothed_linesearch(
+    root, qacc: jax.Array, direction: jax.Array, iterations: int
+) -> jax.Array:
+  """Step size along ``direction`` that minimizes the smoothed cost.
+
+  ``root`` is the gradient of a convex cost (the smoothed stationarity
+  residual), so along the line ``phi'(a) = root(q + a p) . p`` is increasing
+  and ``phi''(a) = p^T (d root/d q) p > 0``. Like ``_linesearch``, this is a
+  bracketed Newton iteration on ``phi'``, but it evaluates the smoothed cost's
+  derivatives directly (one JVP per iteration) instead of the hard cost's
+  piecewise-quadratic coefficients.
+
+  Starting from the full Newton step ``a = 1``, it expands (``a <- max(Newton,
+  2a)``) until ``phi'`` changes sign, because on the smoothed residual Newton
+  typically undershoots: rows that switch off along the step lower the
+  curvature, so the minimizer lies beyond ``a = 1``. Once bracketed, it takes
+  Newton steps, bisecting when a Newton step leaves the bracket. If no sign
+  change is found, it returns the furthest point with ``phi' < 0``, which still
+  decreases the cost.
+  """
+  dtype = qacc.dtype
+  inf = jp.asarray(jp.inf, dtype)
+
+  def derivs(alpha):
+    r, jr = jax.jvp(root, (qacc + alpha * direction,), (direction,))
+    return jp.dot(r, direction), jp.dot(jr, direction)
+
+  def body(_, carry):
+    lo, hi, alpha = carry
+    d1, d2 = derivs(alpha)
+    lo = jp.where(d1 < 0, alpha, lo)
+    hi = jp.where(d1 > 0, alpha, hi)
+    newton = alpha - d1 / jp.maximum(d2, jp.finfo(dtype).tiny)
+    bracketed = jp.isfinite(hi)
+    inside = (newton > lo) & (newton < hi)
+    next_bracketed = jp.where(inside, newton, 0.5 * (lo + hi))
+    next_expand = jp.maximum(newton, 2 * alpha)
+    alpha = jp.where(d1 == 0, alpha, jp.where(bracketed, next_bracketed, next_expand))
+    return lo, hi, alpha
+
+  init = (jp.asarray(0.0, dtype), inf, jp.asarray(1.0, dtype))
+  lo, hi, alpha = jax.lax.fori_loop(0, iterations, body, init)
+  # Bracketed: the Newton/bisection iterate lies in [lo, hi]. Not bracketed:
+  # every point tried had phi' < 0, so the furthest one (lo) is safe.
+  return jp.where(jp.isfinite(hi), alpha, jp.maximum(lo, jp.asarray(1.0, dtype)))
+
+
+def _refine_smoothed_root(
+    root,
+    qacc_hard: jax.Array,
+    iterations: int,
+    tolerance: float,
+    floor: jax.Array | float = 0.0,
+    ls_iterations: int = 0,
+    fallback_enable: bool = True,
+) -> tuple[jax.Array, jax.Array]:
+  """Line-searched Newton from the hard solution toward the smoothed root.
+
+  The result is only the gradient's evaluation point; forward values stay
+  hard. Each Newton step uses ``ls_iterations`` smoothed line-search trials;
+  with 0 the full Newton step is taken (plain Newton, no line search cost).
+  Returns ``(qacc_eval, accepted)``.
+
+  With ``fallback_enable`` (the default), the refined point is accepted only if it is
+  finite and its smoothed residual satisfies
+  ``|r| <= max(tolerance * |r(qacc_hard)|, floor)``, where ``floor`` is the
+  precision floor of the residual. Otherwise ``qacc_hard`` is returned, which
+  gives the surrogate gradient, because a partially converged point can give a
+  gradient worse than the surrogate. With ``fallback_enable=False`` the tolerance
+  check is skipped and the refined point is used whenever it is finite;
+  non-finite points always fall back, since they would only give NaN
+  gradients.
   """
 
   def body(qacc, _):
-    step = jp.linalg.solve(jax.jacfwd(root)(qacc), root(qacc))
-    return qacc - step, None
+    direction = -jp.linalg.solve(jax.jacfwd(root)(qacc), root(qacc))
+    alpha = _smoothed_linesearch(root, qacc, direction, ls_iterations)
+    return qacc + alpha * direction, None
 
-  qacc, _ = jax.lax.scan(body, qacc_hard, None, length=iters)
-  better = jp.linalg.norm(root(qacc)) < jp.linalg.norm(root(qacc_hard))
-  return jp.where(better, qacc, qacc_hard)
+  qacc, _ = jax.lax.scan(body, qacc_hard, None, length=iterations)
+  r_hard = jp.linalg.norm(root(qacc_hard))
+  r_eval = jp.linalg.norm(root(qacc))
+  accepted = jp.isfinite(r_eval) & jp.all(jp.isfinite(qacc))
+  if fallback_enable:
+    accepted &= r_eval <= jp.maximum(tolerance * r_hard, floor)
+  return jp.where(accepted, qacc, qacc_hard), accepted
 
 
 def _update_constraint(
@@ -866,7 +978,7 @@ def _root_tangent_solve(g, y):
 def _solve_ift(m: Model, d: Data) -> Data:
   """Finds forces using a custom-root implicit gradient.
 
-  With active-set smoothing on and ``opt.activeset_refinement_iters > 0``, the
+  With active-set smoothing on and ``opt.refinement_iterations > 0``, the
   gradient is evaluated at the smoothed residual's root (reached by Newton
   iterations from the hard solution) instead of at the hard solution, while
   the forward value stays the hard solution (straight-through).
@@ -875,9 +987,9 @@ def _solve_ift(m: Model, d: Data) -> Data:
 
   qacc_guess = _warmstart_qacc(m, d)
   root = lambda qacc: _root(m, d, qacc)
-  iters = _activeset_refinement_iters(m)
+  iterations = _refinement_iterations(m)
   # With every softness 0 the smoothed root is the hard solution: skip.
-  refine = iters > 0 and any(s > 0 for s in _activeset_softnesses(m))
+  refine = iterations > 0 and any(s > 0 for s in _activeset_softnesses(m))
 
   if not refine:
     solve_hard = lambda _, qacc: _root_iterative_solve(m, d, qacc)
@@ -888,9 +1000,24 @@ def _solve_ift(m: Model, d: Data) -> Data:
     )
   else:
 
+    tolerance = _refinement_tolerance(m)
+    ls_iterations = _refinement_ls_iterations(m)
+    fallback_enable = _refinement_fallback_enable(m)
+
     def solve_refined(_, qacc):
       qacc_hard, niter = _root_iterative_solve(m, d, qacc)
-      qacc_eval = _refine_smoothed_root(root, qacc_hard, iters)
+      # Residual precision floor: cancellation in Ma - qfrc_smooth - qfrc_con.
+      ctx_hard = Context.create(m, d.replace(qacc=qacc_hard), grad=False)
+      scale = (
+          jp.linalg.norm(ctx_hard.Ma)
+          + jp.linalg.norm(d.qfrc_smooth)
+          + jp.linalg.norm(ctx_hard.qfrc_constraint)
+      )
+      floor = 64 * jp.finfo(qacc_hard.dtype).eps * scale
+      qacc_eval, _ = _refine_smoothed_root(
+          root, qacc_hard, iterations, tolerance, floor, ls_iterations,
+          fallback_enable,
+      )
       # The hard solution rides along as aux, so it is not solved twice.
       return qacc_eval, (niter, qacc_hard)
 
@@ -957,13 +1084,16 @@ def solve(m: Model, d: Data) -> Data:
   The active-set smoothing options (``opt.contact_activeset_softness``,
   ``opt.limit_activeset_softness``, ``opt.frictionloss_activeset_softness``) only act in the
   ``ift`` backward pass; enabling one with another backend raises instead of
-  being silently ignored. ``opt.activeset_refinement_iters`` (Newton
+  being silently ignored. ``opt.refinement_iterations`` (Newton
   iterations to the smoothed root, where the gradient is then evaluated) only
   acts when some softness is > 0.
   """
   backend = grad_backend()
   softnesses = _activeset_softnesses(m)
-  _activeset_refinement_iters(m)  # validate on every backend
+  _refinement_iterations(m)  # validate on every backend
+  _refinement_tolerance(m)
+  _refinement_ls_iterations(m)
+  _refinement_fallback_enable(m)
   if backend != 'ift' and any(softness > 0 for softness in softnesses):
     enabled = [n for n, t in zip(_ACTIVESET_SOFTNESS_FIELDS, softnesses) if t > 0]
     raise ValueError(

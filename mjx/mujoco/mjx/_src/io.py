@@ -261,8 +261,17 @@ def _put_option(
       'frictionloss_activeset_softness',
   ):
     fields[name] = float(getattr(o, name, 0.0))
-  fields['activeset_refinement_iters'] = int(
-      getattr(o, 'activeset_refinement_iters', 0)
+  fields['refinement_iterations'] = int(
+      getattr(o, 'refinement_iterations', 0)
+  )
+  fields['refinement_tolerance'] = float(
+      getattr(o, 'refinement_tolerance', 1e-6)
+  )
+  fields['refinement_ls_iterations'] = int(
+      getattr(o, 'refinement_ls_iterations', 0)
+  )
+  fields['refinement_fallback_enable'] = bool(
+      getattr(o, 'refinement_fallback_enable', True)
   )
   pw_solimp = getattr(o, 'pw_solimp', None)
   fields['pw_solimp'] = None if pw_solimp is None else jp.array(pw_solimp)

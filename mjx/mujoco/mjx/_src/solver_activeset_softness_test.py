@@ -86,7 +86,7 @@ def _max_jump(slopes: np.ndarray) -> float:
   return float(np.max(np.abs(np.diff(slopes))))
 
 
-class ContactActiveTauTest(absltest.TestCase):
+class ContactActivesetSoftnessTest(absltest.TestCase):
 
   def setUp(self):
     super().setUp()
@@ -208,7 +208,7 @@ def _hinge(attrs: str, qpos: float, **softnesses):
   return mx.replace(opt=mx.opt.replace(**softnesses)), mjx.put_data(m, d)
 
 
-class LimitAndFrictionlossTauTest(absltest.TestCase):
+class LimitAndFrictionlossActivesetSoftnessTest(absltest.TestCase):
 
   def _sweep(self, attrs, qpos, torques, **softnesses):
     mx, dx = _hinge(attrs, qpos, **softnesses)
@@ -259,9 +259,22 @@ class LimitAndFrictionlossTauTest(absltest.TestCase):
                                     self._sweep(attrs, qpos, torques, contact_activeset_softness=0.1))
 
 
-def _refined_model(softness: float, iters) -> mjx.Model:
-  mx = _model(softness)
-  return mx.replace(opt=mx.opt.replace(activeset_refinement_iters=iters))
+def _refined_model(softness: float, iterations, tolerance=None, xml: str = _BOX_XML,
+                   ls_iterations=None, fallback_enable=None) -> mjx.Model:
+  mx = mjx.put_model(mujoco.MjModel.from_xml_string(xml))
+  opt = mx.opt.replace(contact_activeset_softness=softness,
+                       refinement_iterations=iterations)
+  if tolerance is not None:
+    opt = opt.replace(refinement_tolerance=tolerance)
+  if ls_iterations is not None:
+    opt = opt.replace(refinement_ls_iterations=ls_iterations)
+  if fallback_enable is not None:
+    opt = opt.replace(refinement_fallback_enable=fallback_enable)
+  return mx.replace(opt=opt)
+
+
+# Stiff friction: plain Newton refinement converges slowly here.
+_STIFF_BOX_XML = _BOX_XML.replace('cone="pyramidal"/>', 'cone="pyramidal" impratio="100"/>')
 
 
 @_with_ift
@@ -281,7 +294,7 @@ def _smoothed_root_qacc(softness: float, dx: mjx.Data, dof: int, force: float,
 
 
 class RefinementTest(absltest.TestCase):
-  """opt.activeset_refinement_iters: gradient evaluated at the smoothed root."""
+  """opt.refinement_iterations: gradient evaluated at the smoothed root."""
 
   _THRESHOLD = _MU * _MASS * _G  # stick/slip along dof 0
 
@@ -323,36 +336,170 @@ class RefinementTest(absltest.TestCase):
       np.testing.assert_allclose(grad, fd, rtol=1e-4, atol=1e-7)
 
   def test_refinement_changes_gradient_near_switch(self):
-    """The surrogate (0 iters) and refined gradients differ near stick/slip."""
+    """The surrogate (0 iterations) and refined gradients differ near stick/slip."""
     forces = np.linspace(self._THRESHOLD - 1.0, self._THRESHOLD + 1.0, 81)
     surrogate = _slope(_model(0.1), self.dx, 0, forces)
-    refined = _slope(_refined_model(0.1, 2), self.dx, 0, forces)
+    refined = _slope(_refined_model(0.1, 12), self.dx, 0, forces)
     scale = np.max(np.abs(_slope(_model(0.0), self.dx, 0, forces)))
     self.assertGreater(np.max(np.abs(refined - surrogate)) / scale, 0.05)
 
-  def test_two_iters_close_to_converged(self):
-    """Newton from the hard solution converges fast: 2 iters ~ converged."""
+  def test_default_stiffness_iteration_counts(self):
+    """Default stiffness: k=2 is surrogate-or-converged and mostly converged;
+    k=4 matches the converged gradient everywhere."""
     forces = np.linspace(self._THRESHOLD - 3.0, self._THRESHOLD + 3.0, 61)
-    scale = np.max(np.abs(_slope(_model(0.0), self.dx, 0, forces)))
-    two = _slope(_refined_model(0.1, 2), self.dx, 0, forces)
+    surrogate = _slope(_model(0.1), self.dx, 0, forces)
+    two = _slope(_refined_model(0.1, 2, ls_iterations=8), self.dx, 0, forces)
+    four = _slope(_refined_model(0.1, 4, ls_iterations=8), self.dx, 0, forces)
     converged = _slope(_refined_model(0.1, 12), self.dx, 0, forces)
-    self.assertLess(np.max(np.abs(two - converged)) / scale, 0.02)
+    scale = np.max(np.abs(converged))
+    is_surrogate = two == surrogate
+    is_converged = np.abs(two - converged) <= 1e-4 * scale
+    self.assertTrue(np.all(is_surrogate | is_converged))
+    self.assertGreater(np.mean(is_converged), 0.5)
+    np.testing.assert_allclose(four, converged, rtol=0, atol=1e-6 * scale)
 
-  def test_safeguard_keeps_start_when_newton_fails(self):
-    """If Newton does not reduce the residual (or goes non-finite), keep the start."""
-    start = jp.array([3.0])
-    # Newton on arctan diverges from |x| > ~1.39.
-    np.testing.assert_array_equal(
-        solver._refine_smoothed_root(jp.arctan, start, 3), start)
-    # Converging case moves toward the root.
-    near = jp.array([0.5])
-    out = solver._refine_smoothed_root(jp.arctan, near, 3)
-    self.assertLess(float(jp.abs(out[0])), 1e-6)
-    # Non-finite iterates fall back to the start.
-    # Finite residual at the start, NaN where the Newton step lands (q = 10).
+  def test_linesearch_handles_overshoot_and_undershoot(self):
+    """The smoothed line search minimizes along the Newton direction both ways."""
+    cases = (
+        ('overshoot', jp.tanh, 1.5),  # full Newton step jumps far past 0
+        ('undershoot', lambda q: q**3 + q, 2.0),  # curvature drops: step too short
+    )
+    for name, root, x0 in cases:
+      q = jp.array([x0])
+      direction = -jp.linalg.solve(jax.jacfwd(root)(q), root(q))
+      alpha = solver._smoothed_linesearch(root, q, direction, 8)
+      if name == 'undershoot':
+        self.assertGreater(float(alpha), 1.0)  # needs bracket expansion
+      else:
+        self.assertLess(float(alpha), 1.0)
+      self.assertLess(float(jp.abs(root(q + alpha * direction)[0])), 1e-6, msg=name)
+
+  def test_refinement_converges_where_plain_newton_diverges(self):
+    """Newton on arctan diverges from |x| > ~1.39; the line search fixes it."""
+    out, accepted = solver._refine_smoothed_root(jp.arctan, jp.array([3.0]), 4, 1e-6, ls_iterations=8)
+    self.assertTrue(bool(accepted))
+    self.assertLess(float(jp.abs(out[0])), 1e-8)
+
+  def test_fallback_rejects_partial_convergence(self):
+    """Not converged to tolerance: return the start (the surrogate), never in between."""
+    # 2-D, so one exact line search along the Newton direction cannot land on
+    # the root (in 1-D it would).
+    start = jp.array([2.0, 0.5])
+    cubic = lambda q: jp.array([q[0]**3 + q[0] + 0.5 * q[1], 4.0 * q[1]**3 + q[1] + 0.5 * q[0]])
+    out, accepted = solver._refine_smoothed_root(cubic, start, 1, 1e-12)
+    self.assertFalse(bool(accepted))
+    np.testing.assert_array_equal(out, start)
+    # Same start, enough iterations: accepted.
+    out, accepted = solver._refine_smoothed_root(cubic, start, 8, 1e-12, ls_iterations=8)
+    self.assertTrue(bool(accepted))
+    # Non-finite iterates are rejected: finite at the start, NaN where steps land.
     nan_root = lambda q: jp.where(q < 5.0, q - 10.0, jp.nan)
-    np.testing.assert_array_equal(
-        solver._refine_smoothed_root(nan_root, start, 1), start)
+    out, accepted = solver._refine_smoothed_root(nan_root, jp.array([3.0]), 1, 1e-6)
+    self.assertFalse(bool(accepted))
+    np.testing.assert_array_equal(out, jp.array([3.0]))
+
+  def test_stiff_refined_gradient_is_surrogate_or_converged(self):
+    """With stiff friction, k=2 is not converged everywhere; the fallback must
+    give exactly the surrogate there, and a near-converged gradient elsewhere."""
+    m = mujoco.MjModel.from_xml_string(_STIFF_BOX_XML)
+    dx = mjx.put_data(m, _resting_data(m))
+    forces = np.linspace(self._THRESHOLD - 2.0, self._THRESHOLD + 2.0, 41)
+    surrogate = _slope(_refined_model(0.1, 0, xml=_STIFF_BOX_XML), dx, 0, forces)
+    two = _slope(_refined_model(0.1, 2, xml=_STIFF_BOX_XML, ls_iterations=8), dx, 0, forces)
+    converged = _slope(_refined_model(0.1, 12, xml=_STIFF_BOX_XML), dx, 0, forces)
+    scale = np.max(np.abs(converged))
+    is_surrogate = two == surrogate
+    is_converged = np.abs(two - converged) <= 1e-4 * scale
+    self.assertTrue(np.all(is_surrogate | is_converged))
+    self.assertTrue(np.any(is_surrogate))  # the fallback actually triggered
+
+  def test_stiff_converges_in_six_iters(self):
+    """With the line search, stiff friction converges in ~6 iterations (was ~12)."""
+    m = mujoco.MjModel.from_xml_string(_STIFF_BOX_XML)
+    dx = mjx.put_data(m, _resting_data(m))
+    forces = np.linspace(self._THRESHOLD - 2.0, self._THRESHOLD + 2.0, 41)
+    six = _slope(_refined_model(0.1, 6, xml=_STIFF_BOX_XML, ls_iterations=8), dx, 0, forces)
+    converged = _slope(_refined_model(0.1, 12, xml=_STIFF_BOX_XML), dx, 0, forces)
+    np.testing.assert_allclose(six, converged, rtol=0, atol=1e-6 * np.max(np.abs(converged)))
+
+  def test_ls_iterations_zero_is_plain_newton(self):
+    """refinement_ls_iterations=0 takes full Newton steps, bit-identically."""
+    root = lambda q: jp.array([q[0]**3 + q[0] + 0.5 * q[1], 4.0 * q[1]**3 + q[1] + 0.5 * q[0]])
+    start = jp.array([2.0, 0.5])
+    q = start
+    for _ in range(3):
+      q = q - jp.linalg.solve(jax.jacfwd(root)(q), root(q))
+    out, _ = solver._refine_smoothed_root(root, start, 3, float('inf'), ls_iterations=0)
+    np.testing.assert_array_equal(out, q)
+    # With the line search the iterates differ (and converge faster here).
+    out_ls, _ = solver._refine_smoothed_root(root, start, 3, float('inf'), ls_iterations=8)
+    self.assertFalse(np.array_equal(out_ls, q))
+    self.assertLess(float(jp.linalg.norm(root(out_ls))), float(jp.linalg.norm(root(q))))
+
+  def test_ls_iterations_zero_still_surrogate_or_converged(self):
+    """Without the line search, the fallback still guarantees no in-between gradient."""
+    m = mujoco.MjModel.from_xml_string(_STIFF_BOX_XML)
+    dx = mjx.put_data(m, _resting_data(m))
+    forces = np.linspace(self._THRESHOLD - 2.0, self._THRESHOLD + 2.0, 21)
+    surrogate = _slope(_refined_model(0.1, 0, xml=_STIFF_BOX_XML), dx, 0, forces)
+    plain = _slope(_refined_model(0.1, 4, xml=_STIFF_BOX_XML, ls_iterations=0), dx, 0, forces)
+    converged = _slope(_refined_model(0.1, 12, xml=_STIFF_BOX_XML), dx, 0, forces)
+    scale = np.max(np.abs(converged))
+    self.assertTrue(np.all((plain == surrogate) | (np.abs(plain - converged) <= 1e-4 * scale)))
+
+  def test_invalid_ls_iterations_raise(self):
+    for bad, err in ((-1, ValueError), (2.0, TypeError), (True, TypeError),
+                     (jp.asarray(8), TypeError)):
+      with self.assertRaises(err, msg=repr(bad)):
+        _with_ift(mjx.forward)(_refined_model(0.1, 2, ls_iterations=bad), self.dx)
+
+  def test_fallback_disabled_uses_partial_point(self):
+    """refinement_fallback_enable=False skips the tolerance check (not the NaN guard)."""
+    start = jp.array([2.0, 0.5])
+    cubic = lambda q: jp.array([q[0]**3 + q[0] + 0.5 * q[1], 4.0 * q[1]**3 + q[1] + 0.5 * q[0]])
+    on, acc_on = solver._refine_smoothed_root(cubic, start, 1, 1e-12, fallback_enable=True)
+    off, acc_off = solver._refine_smoothed_root(cubic, start, 1, 1e-12, fallback_enable=False)
+    self.assertFalse(bool(acc_on))
+    np.testing.assert_array_equal(on, start)
+    self.assertTrue(bool(acc_off))
+    self.assertFalse(np.array_equal(off, start))  # the partial point is used
+    # Non-finite points still fall back with the toggle off.
+    nan_root = lambda q: jp.where(q < 5.0, q - 10.0, jp.nan)
+    out, accepted = solver._refine_smoothed_root(
+        nan_root, jp.array([3.0]), 1, 1e-6, fallback_enable=False)
+    self.assertFalse(bool(accepted))
+    np.testing.assert_array_equal(out, jp.array([3.0]))
+
+  def test_fallback_disabled_gives_in_between_gradients(self):
+    """Stiff box, k=2 plain Newton: with the fallback off, some gradients are
+    neither the surrogate nor converged (what the fallback prevents); forward
+    values are still unchanged."""
+    m = mujoco.MjModel.from_xml_string(_STIFF_BOX_XML)
+    dx = mjx.put_data(m, _resting_data(m))
+    forces = np.linspace(self._THRESHOLD - 2.0, self._THRESHOLD + 2.0, 21)
+    surrogate = _slope(_refined_model(0.1, 0, xml=_STIFF_BOX_XML), dx, 0, forces)
+    converged = _slope(_refined_model(0.1, 12, xml=_STIFF_BOX_XML), dx, 0, forces)
+    off = _slope(_refined_model(0.1, 2, xml=_STIFF_BOX_XML, fallback_enable=False), dx, 0, forces)
+    scale = np.max(np.abs(converged))
+    in_between = (off != surrogate) & (np.abs(off - converged) > 1e-4 * scale)
+    self.assertTrue(np.any(in_between))
+    d = dx.replace(qfrc_applied=dx.qfrc_applied.at[0].set(self._THRESHOLD))
+    hard = _with_ift(jax.jit(mjx.forward))(_refined_model(0.0, 0, xml=_STIFF_BOX_XML), d)
+    off_fwd = _with_ift(jax.jit(mjx.forward))(
+        _refined_model(0.1, 2, xml=_STIFF_BOX_XML, fallback_enable=False), d)
+    np.testing.assert_array_equal(hard.qacc, off_fwd.qacc)
+
+  def test_invalid_fallback_enable_raise(self):
+    for bad in (1, 0, 'yes', jp.asarray(True)):
+      with self.assertRaises(TypeError, msg=repr(bad)):
+        _with_ift(mjx.forward)(_refined_model(0.1, 2, fallback_enable=bad), self.dx)
+
+  def test_invalid_tol_raise(self):
+    for bad, err in ((-1.0, ValueError), (float('nan'), ValueError),
+                     (float('inf'), ValueError), (True, TypeError),
+                     (jp.asarray(1e-6), TypeError)):
+      with self.assertRaises(err, msg=repr(bad)):
+        _with_ift(mjx.forward)(_refined_model(0.1, 2, tolerance=bad), self.dx)
 
   def test_invalid_iters_raise(self):
     for bad, err in ((-1, ValueError), (1.5, TypeError), (True, TypeError),

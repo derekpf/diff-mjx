@@ -516,7 +516,10 @@ class Option(PyTreeNode):
   contact_activeset_softness: float
   limit_activeset_softness: float
   frictionloss_activeset_softness: float
-  activeset_refinement_iters: int
+  refinement_iterations: int
+  refinement_ls_iterations: int
+  refinement_tolerance: float
+  refinement_fallback_enable: bool
   pw_solimp: Optional[jax.Array]
   scan_loop: bool
   _impl: Union[OptionJAX, mjxw_types.OptionWarp]
