@@ -513,6 +513,9 @@ class Option(PyTreeNode):
   contact_st_enable: bool
   sensor_softness: float
   sensor_st_enable: bool
+  contact_activeset_softness: float
+  limit_activeset_softness: float
+  frictionloss_activeset_softness: float
   pw_solimp: Optional[jax.Array]
   scan_loop: bool
   _impl: Union[OptionJAX, mjxw_types.OptionWarp]

@@ -26,6 +26,7 @@ from mujoco.mjx._src import support
 # pylint: disable=g-importing-member
 from mujoco.mjx._src.dataclasses import PyTreeNode
 from mujoco.mjx._src.types import ConeType
+from mujoco.mjx._src.types import ConstraintType
 from mujoco.mjx._src.types import Data
 from mujoco.mjx._src.types import DataJAX
 from mujoco.mjx._src.types import DisableBit
@@ -78,7 +79,15 @@ class Context(PyTreeNode):
   h: jax.Array
 
   @classmethod
-  def create(cls, m: Model, d: Data, grad: bool = True) -> 'Context':
+  def create(
+      cls,
+      m: Model,
+      d: Data,
+      grad: bool = True,
+      contact_softness: float = 0.0,
+      limit_softness: float = 0.0,
+      frictionloss_softness: float = 0.0,
+  ) -> 'Context':
     if not isinstance(d._impl, DataJAX) or not isinstance(
         m.opt._impl, OptionJAX
     ):
@@ -118,7 +127,10 @@ class Context(PyTreeNode):
         u=0.0,
         h=0.0,
     )
-    ctx = _update_constraint(m, d, ctx)
+    ctx = _update_constraint(
+        m, d, ctx, contact_softness=contact_softness, limit_softness=limit_softness,
+        frictionloss_softness=frictionloss_softness,
+    )
     if grad:
       ctx = _update_gradient(m, d, ctx)
       ctx = ctx.replace(search=-ctx.Mgrad)  # start with preconditioned gradient
@@ -256,7 +268,46 @@ def _while_loop_scan(cond_fun, body_fun, init_val, max_iter):
   return jax.lax.scan(_fun, init, None, length=max_iter)[0][0]
 
 
-def _update_constraint(m: Model, d: Data, ctx: Context) -> Context:
+_ACTIVESET_SOFTNESS_FIELDS = (
+    'contact_activeset_softness',
+    'limit_activeset_softness',
+    'frictionloss_activeset_softness',
+)
+
+
+def _activeset_softnesses(m: Model) -> tuple[float, float, float]:
+  """Returns the validated active-set smoothing widths as Python floats.
+
+  The widths select code paths at trace time, so they must be concrete,
+  finite, non-negative scalars (0 disables smoothing).
+  """
+  softnesses = []
+  for name in _ACTIVESET_SOFTNESS_FIELDS:
+    value = getattr(m.opt, name)
+    if isinstance(value, jax.Array):
+      # A jax.Array option field is a pytree leaf, so it is traced under jit.
+      raise TypeError(
+          f'opt.{name} must be a Python float, not a jax.Array; it is static '
+          'and selects code paths at trace time.'
+      )
+    try:
+      softness = float(value)
+    except TypeError as e:
+      raise TypeError(f'opt.{name} must be a scalar, got {value!r}.') from e
+    if not (softness >= 0.0 and softness < float('inf')):
+      raise ValueError(f'opt.{name} must be finite and >= 0, got {softness}.')
+    softnesses.append(softness)
+  return tuple(softnesses)
+
+
+def _update_constraint(
+    m: Model,
+    d: Data,
+    ctx: Context,
+    contact_softness: float = 0.0,
+    limit_softness: float = 0.0,
+    frictionloss_softness: float = 0.0,
+) -> Context:
   """Updates constraint force and resulting cost given last solver iteration.
 
   Corresponds to CGupdateConstraint in mujoco/src/engine/engine_solver.c
@@ -265,6 +316,17 @@ def _update_constraint(m: Model, d: Data, ctx: Context) -> Context:
     m: model defining constraints
     d: data which contains latest qacc and smooth terms
     ctx: current solver context
+    contact_softness: if > 0, the force of nominal contact rows (in contact,
+      ``efc_pos < efc_margin``) uses ``D * sj.relu(-Jaref, softness)`` (smooth,
+      non-gated: ``softness * softplus(-Jaref / softness)``, slope ``sigmoid``) instead
+      of ``D * max(0, -Jaref)``. Used only by the IFT residual (``_root``), so
+      the forward solve is unchanged; pyramidal cone only. Non-gated on
+      purpose: the gated ``x * sigmoid(x)`` has negative slopes, which can make
+      the IFT residual Jacobian indefinite.
+    limit_softness: if > 0, engaged joint/tendon limit rows (``efc_pos < efc_margin``)
+      use ``D * sj.relu(-Jaref, softness)`` (IFT residual only).
+    frictionloss_softness: if > 0, friction-loss rows use a smooth clip of
+      ``-Jaref`` to ``[-r f, r f]`` instead of the hard clip (IFT residual only).
 
   Returns:
     context with new constraint force and costs
@@ -295,7 +357,19 @@ def _update_constraint(m: Model, d: Data, ctx: Context) -> Context:
     efc_force = d._impl.efc_D * -ctx.Jaref * active + floss_force
     cost = 0.5 * jp.sum(d._impl.efc_D * ctx.Jaref * ctx.Jaref * active)
     dm, u, h = 0.0, 0.0, 0.0
+    if contact_softness > 0:
+      # Smooth the Jaref mask (liftoff, stick/slip) of nominal contact rows only:
+      # pw_solimp rows (efc_pos >= efc_margin) and padding rows keep the hard mask.
+      nominal = (d._impl.efc_type >= ConstraintType.CONTACT_FRICTIONLESS) & (
+          d._impl.efc_pos < d._impl.efc_margin
+      )
+      smooth_force = d._impl.efc_D * sj.relu(
+          -ctx.Jaref, softness=contact_softness, mode='smooth', gated=False
+      )
+      efc_force = jp.where(nominal, smooth_force, efc_force)
   elif m.opt.cone == ConeType.ELLIPTIC:
+    if contact_softness > 0:
+      raise NotImplementedError('contact_activeset_softness requires the pyramidal cone.')
     friction = d._impl.contact.friction[d._impl.contact.dim > 1]
     efc_address = d._impl.contact.efc_address[d._impl.contact.dim > 1]
     dim = d._impl.contact.dim[d._impl.contact.dim > 1]
@@ -356,6 +430,32 @@ def _update_constraint(m: Model, d: Data, ctx: Context) -> Context:
       h = jax.vmap(jp.multiply)(h, middle_zone)
   else:
     raise NotImplementedError(f'unsupported cone type: {m.opt.cone}')
+
+  if limit_softness > 0:
+    # Engaged limit rows only; disengaged rows keep their zero force.
+    is_limit = (d._impl.efc_type == ConstraintType.LIMIT_JOINT) | (
+        d._impl.efc_type == ConstraintType.LIMIT_TENDON
+    )
+    engaged = is_limit & (d._impl.efc_pos < d._impl.efc_margin)
+    smooth_force = d._impl.efc_D * sj.relu(
+        -ctx.Jaref, softness=limit_softness, mode='smooth', gated=False
+    )
+    efc_force = jp.where(engaged, smooth_force, efc_force)
+  if frictionloss_softness > 0:
+    # Smooth clip of x = -Jaref to [-b, b], b = r * f (the stick/slip threshold in Jaref units).
+    is_fl = (
+        (d._impl.efc_type == ConstraintType.FRICTION_DOF)
+        | (d._impl.efc_type == ConstraintType.FRICTION_TENDON)
+    ) & (d._impl.efc_frictionloss > 0)
+    r = 1.0 / (d._impl.efc_D + (d._impl.efc_D == 0.0) * mujoco.mjMINVAL)
+    b = r * d._impl.efc_frictionloss
+    x = -ctx.Jaref
+    soft_clip = (
+        x
+        - sj.relu(x - b, softness=frictionloss_softness, mode='smooth', gated=False)
+        + sj.relu(-x - b, softness=frictionloss_softness, mode='smooth', gated=False)
+    )
+    efc_force = jp.where(is_fl, d._impl.efc_D * soft_clip, efc_force)
 
   qfrc_constraint = d._impl.efc_J.T @ efc_force
   gauss = 0.5 * jp.dot(ctx.Ma - d.qfrc_smooth, ctx.qacc - d.qacc_smooth)
@@ -676,7 +776,15 @@ def _solve_scan(m: Model, d: Data) -> Data:
 
 def _root(m: Model, d: Data, qacc: jax.Array) -> jax.Array:
   """Stationarity residual ``M qacc - qfrc_smooth - qfrc_constraint``."""
-  ctx = Context.create(m, d.replace(qacc=qacc), grad=False)
+  contact_softness, limit_softness, frictionloss_softness = _activeset_softnesses(m)
+  ctx = Context.create(
+      m,
+      d.replace(qacc=qacc),
+      grad=False,
+      contact_softness=contact_softness,
+      limit_softness=limit_softness,
+      frictionloss_softness=frictionloss_softness,
+  )
   return ctx.Ma - d.qfrc_smooth - ctx.qfrc_constraint
 
 
@@ -784,5 +892,20 @@ def solve(m: Model, d: Data) -> Data:
     stops before convergence (e.g. ``opt.iterations == 1``).
 
   For every backend the line search loop is selected by ``opt.scan_loop``.
+
+  The active-set smoothing options (``opt.contact_activeset_softness``,
+  ``opt.limit_activeset_softness``, ``opt.frictionloss_activeset_softness``) only act in the
+  ``ift`` backward pass; enabling one with another backend raises instead of
+  being silently ignored.
   """
-  return _BACKENDS[grad_backend()](m, d)
+  backend = grad_backend()
+  softnesses = _activeset_softnesses(m)
+  if backend != 'ift' and any(softness > 0 for softness in softnesses):
+    enabled = [n for n, t in zip(_ACTIVESET_SOFTNESS_FIELDS, softnesses) if t > 0]
+    raise ValueError(
+        f'{", ".join(enabled)} > 0 requires MJX_GRAD_BACKEND=ift (got '
+        f'{backend!r}); active-set smoothing only acts in the IFT backward pass.'
+    )
+  if softnesses[0] > 0 and m.opt.cone != ConeType.PYRAMIDAL:
+    raise NotImplementedError('contact_activeset_softness requires the pyramidal cone.')
+  return _BACKENDS[backend](m, d)

@@ -255,6 +255,12 @@ def _put_option(
   fields['contact_st_enable'] = bool(getattr(o, 'contact_st_enable', False))
   fields['sensor_softness'] = float(getattr(o, 'sensor_softness', 0.0))
   fields['sensor_st_enable'] = bool(getattr(o, 'sensor_st_enable', False))
+  for name in (
+      'contact_activeset_softness',
+      'limit_activeset_softness',
+      'frictionloss_activeset_softness',
+  ):
+    fields[name] = float(getattr(o, name, 0.0))
   pw_solimp = getattr(o, 'pw_solimp', None)
   fields['pw_solimp'] = None if pw_solimp is None else jp.array(pw_solimp)
   fields['scan_loop'] = bool(getattr(o, 'scan_loop', True))
