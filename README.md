@@ -114,6 +114,8 @@ inputs. These defaults stay unchanged.
 
 - **Realised solver iterations.** Every solver backend writes the iteration count it actually ran to `Data._impl.solver_niter`.
 
+- **Active-set smoothing.** Adds `opt.contact_activeset_softness`, `opt.limit_activeset_softness`, and `opt.frictionloss_activeset_softness`, which smooth linear (per-row) active-set switches in the `ift` backward pass only. See [Active-set smoothing](#active-set-smoothing-ift-backward).
+
 ## Constraint-solver derivative backends
 
 The JAX constraint solver can be differentiated in several ways, selected by the `MJX_GRAD_BACKEND` environment variable. The forward physics (MJX's convex Gauss-principle solve, Newton or CG, pyramidal or elliptic cones) is the same for every backend; only the gradient differs. Ported from [calumarnott/mujoco](https://github.com/calumarnott/mujoco) (`3.9.0-derivatives`, Layeghi et al., [arXiv:2607.24959](https://arxiv.org/abs/2607.24959)) and adapted to this fork.
@@ -161,6 +163,41 @@ Remat is `jax.remat(env.step, prevent_cse=False)`, as in forlax's `remat_enable`
 Benchmarks, validation scripts, raw results, and reproduction commands are in [`mjx/benchmarks/ift_solver`](mjx/benchmarks/ift_solver/README.md).
 
 **Tests.** `mjx/mujoco/mjx/_src/solver_test.py` (backend selection and forward equivalence against MuJoCo C) and `mjx/mujoco/mjx/_src/solver_grad_test.py` (gradients against unrolled differentiation and finite differences).
+
+## Active-set smoothing (IFT backward)
+
+**What it smooths.** At the solution, each inequality row's force is a ReLU of its residual `Jaref = J qacc - aref`: `f_i = D_i * max(0, -Jaref_i)`. The `ift` backward differentiates the stationarity residual at the converged `qacc`, so each row adds `m_i * D_i * J_i^T J_i` to the residual Jacobian, where `m_i = [Jaref_i < 0]` is the row's active-set mask. The force is continuous where a row switches on or off, but the gradient jumps by that row's rank-1 term. These switches are liftoff, stick/slip (pyramidal edges switching), limit release, and friction-loss stick/slip.
+
+**Method.** In the residual used only by the `ift` backward (`solver._root`), the ReLU of the selected rows becomes
+
+```
+f_i = D_i * sj.relu(-Jaref_i, softness, mode='smooth', gated=False)
+    = D_i * softness * softplus(-Jaref_i / softness)
+```
+
+Its slope is `D_i * sigmoid(-Jaref_i / softness)`. Near a switch, the gradient blends the Jacobians on either side of it instead of jumping between them. The slope stays in `(0, D_i)`, so the residual Jacobian stays positive definite. The gated form, `x * sigmoid(x)`, has negative slopes and can make it indefinite, so it is not used. The forward solve, line search, and reported outputs (`qacc`, `efc_force`, `qfrc_constraint`) keep the hard mask. Forward values are therefore unchanged. The forward solve finds the root of the hard residual, not the smoothed one, so the result is a surrogate gradient, not the derivative of any model.
+
+| option | rows | switch |
+|---|---|---|
+| `contact_activeset_softness` | nominal contact rows: frictionless and pyramidal-edge rows in contact (`efc_pos < efc_margin`) | liftoff, stick/slip |
+| `limit_activeset_softness` | engaged joint and tendon limit rows (`efc_pos < efc_margin`) | limit release |
+| `frictionloss_activeset_softness` | DOF and tendon friction-loss rows | friction-loss stick/slip: the hard clip of `x = -Jaref` to `[-b, b]`, `b = r * frictionloss`, becomes `x - sj.relu(x - b) + sj.relu(-x - b)` |
+
+**Not supported.**
+
+- **Cone smoothing.** Only linear (per-row) switches are smoothed. Pyramidal contacts are linear rows, so `cone="pyramidal"` is covered. Elliptic cones switch zones (stick, slip, separate) through a coupled per-contact projection onto a second-order cone. That needs a different formulation, with care where the tangential magnitude is zero. Setting `contact_activeset_softness > 0` with `cone="elliptic"` raises `NotImplementedError`. Every registered diff-playground environment uses the pyramidal cone.
+- **Limit touchdown.** Limit engagement is not smoothed. A row only exists once a joint or tendon reaches its limit margin, and it switches on at full impedance with `aref = -b * v`, so an approaching limit still gets a force jump. `limit_activeset_softness` covers only the release of an engaged limit. pw_solimp anticipates contact touchdown only and does not apply to limits.
+- **Contact touchdown is left to pw_solimp.** This is not handled by active-set smoothing. pw_solimp rows (`efc_pos >= efc_margin`) and zeroed padding rows keep the hard mask, so the two mechanisms do not overlap. Under `contact_st_enable`, gradients come from the pw_solimp branch. Smoothing applies to that branch's nominal rows, whose definition is identical to the nominal branch's.
+- **Other backends.** Only `ift` reads these options. Setting any of them above 0 with `MJX_GRAD_BACKEND` set to `unrolled`, `scan`, or `while` raises an error instead of being ignored.
+
+**Usage.**
+
+- **Static values.** Each option is a static Python float, so changing it retraces the compiled step. A `jax.Array` raises `TypeError`, because it would be traced. Negative or non-finite values raise `ValueError`.
+- **Zero is exactly hard.** At `0` (the default), the smoothing branch is not traced, so behavior is identical to the hard mask. A small positive softness is not the same: at `Jaref = 0` the slope is 0.5, not 0.
+- **Units.** Softness is in `Jaref` units, the acceleration along the row.
+- **forlax.** `DiffEnvWrapper` accepts the same keyword arguments and validates them at construction.
+
+**Tests.** `mjx/mujoco/mjx/_src/solver_activeset_softness_test.py` checks the following: softness 0 is bit-identical to the default, forward values are unchanged, stick/slip, liftoff, limit release, and friction-loss transitions are smoothed, the gradient converges to the hard one away from a switch, pw_solimp rows are untouched, and the elliptic, backend, and invalid-value guards raise.
 
 <h1>
   <a href="#"><img alt="MuJoCo" src="banner.png" width="100%"/></a>
