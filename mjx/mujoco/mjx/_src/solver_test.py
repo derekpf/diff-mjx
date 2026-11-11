@@ -28,6 +28,12 @@ from mujoco.mjx._src import test_util
 from mujoco.mjx._src.types import ConeType
 import numpy as np
 
+# On NVIDIA GPUs, JAX's default float32 matmul precision is TF32 (~10-bit
+# mantissa). Low-iteration comparisons against MuJoCo C (e.g. Newton with the
+# elliptic cone at 2 iterations) then diverge well past _TOLERANCE, while CPU
+# runs, which upstream CI uses, pass. Compare at full float32 precision.
+jax.config.update('jax_default_matmul_precision', 'highest')
+
 
 # tolerance for difference between MuJoCo and MJX solver calculations,
 # mostly due to float precision
