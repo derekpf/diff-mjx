@@ -197,6 +197,15 @@ Its slope is `D_i * sigmoid(-Jaref_i / softness)`. Near a switch, the gradient b
 - **Units.** Softness is in `Jaref` units, the acceleration along the row.
 - **forlax.** `DiffEnvWrapper` accepts the same keyword arguments and validates them at construction.
 
+**Related work.** These are the closest methods and the gaps that motivated this one. None of them is this exact method: a backward-only softplus on the per-row Jaref mask of MuJoCo's convex soft-constraint solve, restricted to in-contact rows so that it composes with pw_solimp.
+
+- **DiffContact** ([arXiv:2610.35852](https://arxiv.org/abs/2610.35852)). The closest in spirit. The forward rollout is hard contact. The backward pass relaxes the complementarity conditions (separation, clamping, sliding) and differentiates the relaxed point, so the sensitivity stays continuous through liftoff and stick/slip. It targets an NCP solver, not MuJoCo's convex solve.
+- **Dojo** (Howell et al., [arXiv:2203.00806](https://arxiv.org/abs/2203.00806)). It computes smooth gradients by applying the implicit function theorem to a relaxed interior-point solution (central-path parameter > 0) of a hard-contact solver.
+- **Analytic smoothing** (Pang et al., [arXiv:2206.10787](https://arxiv.org/abs/2206.10787)). It smooths a convex quasi-dynamic contact model with a log-barrier relaxation, which gives force-at-a-distance. This changes the model itself, not only the gradient.
+- **Contacts From Distance** (Paulus et al., ICLR 2026, [arXiv:2506.14186](https://arxiv.org/abs/2506.14186)). A backward-only, straight-through mechanism in MJX that gives contact gradients before touch. It is the counterpart for touchdown that pw_solimp implements here.
+- **Implicit contact differentiation in MJX** (Layeghi et al., [arXiv:2607.24959](https://arxiv.org/abs/2607.24959)). The source of the `ift` backend. Its derivative is local to a fixed contact set and friction mode, and its authors note it need not stay valid across contact or friction-mode changes. This method addresses that gap for linear rows.
+- **Simple** (Le Lidec et al., 2024, [paper](https://simple-robotics.github.io/publications/simple-gradients/static/paper/simple2024gradients.pdf)). It observes that active-set implicit gradients do not capture contact-mode boundaries, and suggests combining them with smoothing.
+
 **Tests.** `mjx/mujoco/mjx/_src/solver_activeset_softness_test.py` checks the following: softness 0 is bit-identical to the default, forward values are unchanged, stick/slip, liftoff, limit release, and friction-loss transitions are smoothed, the gradient converges to the hard one away from a switch, pw_solimp rows are untouched, and the elliptic, backend, and invalid-value guards raise.
 
 <h1>
