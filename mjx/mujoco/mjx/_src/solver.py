@@ -14,6 +14,7 @@
 # ==============================================================================
 """Constraint solvers."""
 
+import numbers
 import os
 
 import jax
@@ -298,6 +299,40 @@ def _activeset_softnesses(m: Model) -> tuple[float, float, float]:
       raise ValueError(f'opt.{name} must be finite and >= 0, got {softness}.')
     softnesses.append(softness)
   return tuple(softnesses)
+
+
+def _activeset_refinement_iters(m: Model) -> int:
+  """Returns the validated ``opt.activeset_refinement_iters`` (static int >= 0)."""
+  value = m.opt.activeset_refinement_iters
+  if isinstance(value, (bool, jax.Array)) or not isinstance(
+      value, numbers.Integral
+  ):
+    raise TypeError(
+        'opt.activeset_refinement_iters must be a Python int, got '
+        f'{value!r}; it is static and sets a loop length at trace time.'
+    )
+  if value < 0:
+    raise ValueError(
+        f'opt.activeset_refinement_iters must be >= 0, got {value}.'
+    )
+  return int(value)
+
+
+def _refine_smoothed_root(root, qacc_hard: jax.Array, iters: int) -> jax.Array:
+  """Newton iterations from the hard solution toward the smoothed residual's root.
+
+  The result is only the gradient's evaluation point; forward values stay hard.
+  Safeguard: if the iterations do not reduce the smoothed residual (or produce
+  non-finite values), the hard solution is kept.
+  """
+
+  def body(qacc, _):
+    step = jp.linalg.solve(jax.jacfwd(root)(qacc), root(qacc))
+    return qacc - step, None
+
+  qacc, _ = jax.lax.scan(body, qacc_hard, None, length=iters)
+  better = jp.linalg.norm(root(qacc)) < jp.linalg.norm(root(qacc_hard))
+  return jp.where(better, qacc, qacc_hard)
 
 
 def _update_constraint(
@@ -829,17 +864,43 @@ def _root_tangent_solve(g, y):
 
 
 def _solve_ift(m: Model, d: Data) -> Data:
-  """Finds forces using a custom-root implicit gradient."""
+  """Finds forces using a custom-root implicit gradient.
+
+  With active-set smoothing on and ``opt.activeset_refinement_iters > 0``, the
+  gradient is evaluated at the smoothed residual's root (reached by Newton
+  iterations from the hard solution) instead of at the hard solution, while
+  the forward value stays the hard solution (straight-through).
+  """
   _check_jax_impl(m)
 
   qacc_guess = _warmstart_qacc(m, d)
   root = lambda qacc: _root(m, d, qacc)
-  solve_root = lambda _, qacc: _root_iterative_solve(m, d, qacc)
-  # The iteration count is auxiliary output (not differentiated) so callers
-  # can see how many iterations the forward solve actually needed.
-  qacc, solver_niter = jax.lax.custom_root(
-      root, qacc_guess, solve_root, _root_tangent_solve, has_aux=True
-  )
+  iters = _activeset_refinement_iters(m)
+  # With every softness 0 the smoothed root is the hard solution: skip.
+  refine = iters > 0 and any(s > 0 for s in _activeset_softnesses(m))
+
+  if not refine:
+    solve_hard = lambda _, qacc: _root_iterative_solve(m, d, qacc)
+    # The iteration count is auxiliary output (not differentiated) so callers
+    # can see how many iterations the forward solve actually needed.
+    qacc, solver_niter = jax.lax.custom_root(
+        root, qacc_guess, solve_hard, _root_tangent_solve, has_aux=True
+    )
+  else:
+
+    def solve_refined(_, qacc):
+      qacc_hard, niter = _root_iterative_solve(m, d, qacc)
+      qacc_eval = _refine_smoothed_root(root, qacc_hard, iters)
+      # The hard solution rides along as aux, so it is not solved twice.
+      return qacc_eval, (niter, qacc_hard)
+
+    qacc_eval, (solver_niter, qacc_hard) = jax.lax.custom_root(
+        root, qacc_guess, solve_refined, _root_tangent_solve, has_aux=True
+    )
+    # Value of the hard solution, derivative of the smoothed root.
+    qacc = jax.lax.stop_gradient(qacc_hard) + (
+        qacc_eval - jax.lax.stop_gradient(qacc_eval)
+    )
   d = d.replace(qacc=qacc)
   ctx = Context.create(m, d, grad=False).replace(solver_niter=solver_niter)
 
@@ -896,10 +957,13 @@ def solve(m: Model, d: Data) -> Data:
   The active-set smoothing options (``opt.contact_activeset_softness``,
   ``opt.limit_activeset_softness``, ``opt.frictionloss_activeset_softness``) only act in the
   ``ift`` backward pass; enabling one with another backend raises instead of
-  being silently ignored.
+  being silently ignored. ``opt.activeset_refinement_iters`` (Newton
+  iterations to the smoothed root, where the gradient is then evaluated) only
+  acts when some softness is > 0.
   """
   backend = grad_backend()
   softnesses = _activeset_softnesses(m)
+  _activeset_refinement_iters(m)  # validate on every backend
   if backend != 'ift' and any(softness > 0 for softness in softnesses):
     enabled = [n for n, t in zip(_ACTIVESET_SOFTNESS_FIELDS, softnesses) if t > 0]
     raise ValueError(

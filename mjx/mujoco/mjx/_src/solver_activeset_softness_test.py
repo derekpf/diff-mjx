@@ -22,6 +22,7 @@ import jax
 from jax import numpy as jp
 import mujoco
 from mujoco import mjx
+from mujoco.mjx._src import solver
 import numpy as np
 
 jax.config.update('jax_enable_x64', True)
@@ -256,6 +257,108 @@ class LimitAndFrictionlossTauTest(absltest.TestCase):
       torques = np.linspace(-2.0, 2.0, 41)
       np.testing.assert_array_equal(self._sweep(attrs, qpos, torques),
                                     self._sweep(attrs, qpos, torques, contact_activeset_softness=0.1))
+
+
+def _refined_model(softness: float, iters) -> mjx.Model:
+  mx = _model(softness)
+  return mx.replace(opt=mx.opt.replace(activeset_refinement_iters=iters))
+
+
+@_with_ift
+def _smoothed_root_qacc(softness: float, dx: mjx.Data, dof: int, force: float,
+                        newton_iters: int = 30) -> float:
+  """Independent reference: Newton on the smoothed residual from the hard solution."""
+  mx = _model(softness)
+  d = dx.replace(qfrc_applied=dx.qfrc_applied.at[dof].set(force))
+  d = jax.jit(mjx.forward)(_model(0.0), d)  # hard solution and constraint rows
+  root = jax.jit(lambda q: solver._root(mx, d, q))
+  jac = jax.jit(jax.jacfwd(lambda q: solver._root(mx, d, q)))
+  q = d.qacc
+  for _ in range(newton_iters):
+    q = q - jp.linalg.solve(jac(q), root(q))
+  assert float(jp.linalg.norm(root(q))) < 1e-9
+  return float(q[dof])
+
+
+class RefinementTest(absltest.TestCase):
+  """opt.activeset_refinement_iters: gradient evaluated at the smoothed root."""
+
+  _THRESHOLD = _MU * _MASS * _G  # stick/slip along dof 0
+
+  def setUp(self):
+    super().setUp()
+    m = mujoco.MjModel.from_xml_string(_BOX_XML)
+    self.dx = mjx.put_data(m, _resting_data(m))
+
+  def test_no_softness_is_bit_identical_to_hard(self):
+    """With every softness 0 refinement is skipped, so nothing changes."""
+    forces = np.linspace(self._THRESHOLD - 2.0, self._THRESHOLD + 2.0, 41)
+    np.testing.assert_array_equal(
+        _slope(_model(0.0), self.dx, 0, forces),
+        _slope(_refined_model(0.0, 4), self.dx, 0, forces),
+    )
+
+  @_with_ift
+  def test_forward_unchanged(self):
+    """Forward values stay the hard solution (straight-through)."""
+    for force in (self._THRESHOLD - 0.5, self._THRESHOLD, self._THRESHOLD + 0.5):
+      d = self.dx.replace(qfrc_applied=self.dx.qfrc_applied.at[0].set(force))
+      hard = jax.jit(mjx.forward)(_model(0.0), d)
+      refined = jax.jit(mjx.forward)(_refined_model(0.1, 2), d)
+      np.testing.assert_array_equal(hard.qacc, refined.qacc)
+      np.testing.assert_array_equal(hard._impl.efc_force, refined._impl.efc_force)
+      np.testing.assert_array_equal(hard.qfrc_constraint, refined.qfrc_constraint)
+
+  def test_converged_refinement_is_smoothed_root_derivative(self):
+    """Converged refinement gives the exact derivative of the smoothed root."""
+    softness, h = 0.1, 1e-5
+    for dof, thr in ((0, self._THRESHOLD), (2, _MASS * _G)):
+      forces = np.linspace(thr - 1.0, thr + 1.0, 9)
+      grad = _slope(_refined_model(softness, 12), self.dx, dof, forces)
+      fd = np.array([
+          (_smoothed_root_qacc(softness, self.dx, dof, f + h)
+           - _smoothed_root_qacc(softness, self.dx, dof, f - h)) / (2 * h)
+          for f in forces
+      ])
+      np.testing.assert_allclose(grad, fd, rtol=1e-4, atol=1e-7)
+
+  def test_refinement_changes_gradient_near_switch(self):
+    """The surrogate (0 iters) and refined gradients differ near stick/slip."""
+    forces = np.linspace(self._THRESHOLD - 1.0, self._THRESHOLD + 1.0, 81)
+    surrogate = _slope(_model(0.1), self.dx, 0, forces)
+    refined = _slope(_refined_model(0.1, 2), self.dx, 0, forces)
+    scale = np.max(np.abs(_slope(_model(0.0), self.dx, 0, forces)))
+    self.assertGreater(np.max(np.abs(refined - surrogate)) / scale, 0.05)
+
+  def test_two_iters_close_to_converged(self):
+    """Newton from the hard solution converges fast: 2 iters ~ converged."""
+    forces = np.linspace(self._THRESHOLD - 3.0, self._THRESHOLD + 3.0, 61)
+    scale = np.max(np.abs(_slope(_model(0.0), self.dx, 0, forces)))
+    two = _slope(_refined_model(0.1, 2), self.dx, 0, forces)
+    converged = _slope(_refined_model(0.1, 12), self.dx, 0, forces)
+    self.assertLess(np.max(np.abs(two - converged)) / scale, 0.02)
+
+  def test_safeguard_keeps_start_when_newton_fails(self):
+    """If Newton does not reduce the residual (or goes non-finite), keep the start."""
+    start = jp.array([3.0])
+    # Newton on arctan diverges from |x| > ~1.39.
+    np.testing.assert_array_equal(
+        solver._refine_smoothed_root(jp.arctan, start, 3), start)
+    # Converging case moves toward the root.
+    near = jp.array([0.5])
+    out = solver._refine_smoothed_root(jp.arctan, near, 3)
+    self.assertLess(float(jp.abs(out[0])), 1e-6)
+    # Non-finite iterates fall back to the start.
+    # Finite residual at the start, NaN where the Newton step lands (q = 10).
+    nan_root = lambda q: jp.where(q < 5.0, q - 10.0, jp.nan)
+    np.testing.assert_array_equal(
+        solver._refine_smoothed_root(nan_root, start, 1), start)
+
+  def test_invalid_iters_raise(self):
+    for bad, err in ((-1, ValueError), (1.5, TypeError), (True, TypeError),
+                     (jp.asarray(2), TypeError)):
+      with self.assertRaises(err, msg=repr(bad)):
+        _with_ift(mjx.forward)(_refined_model(0.1, bad), self.dx)
 
 
 if __name__ == '__main__':

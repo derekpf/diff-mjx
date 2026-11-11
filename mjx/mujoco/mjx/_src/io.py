@@ -261,6 +261,9 @@ def _put_option(
       'frictionloss_activeset_softness',
   ):
     fields[name] = float(getattr(o, name, 0.0))
+  fields['activeset_refinement_iters'] = int(
+      getattr(o, 'activeset_refinement_iters', 0)
+  )
   pw_solimp = getattr(o, 'pw_solimp', None)
   fields['pw_solimp'] = None if pw_solimp is None else jp.array(pw_solimp)
   fields['scan_loop'] = bool(getattr(o, 'scan_loop', True))
