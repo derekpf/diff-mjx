@@ -85,3 +85,4 @@ python g1_env_bench.py             # G1 joystick env BPTT, per backend
 | `profile_tangent.py` | tangent-solve component microbenchmark |
 | `analyze.py` | summary tables and plots |
 | `g1_env_bench.py` | BPTT through the diff-playground G1 joystick env (forlax SHAC config) |
+| `cost_smoothing_robots.py` | constraint cost smoothing on Go1/G1 rollouts: residual Jacobian definiteness, refinement acceptance, forward/reverse reproducibility of unconverged solves, float32 IFT accuracy against float64, BPTT timing (the numbers in the repository README; prints to stdout) |
