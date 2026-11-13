@@ -57,16 +57,18 @@ def _check_warp_installed():
     )
 
 
+def _gpu_default_warp() -> bool:
+  """Whether ``MJX_GPU_DEFAULT_WARP`` makes Warp the default on CUDA GPUs."""
+  # TODO(btaba): Remove flag once Warp is ready for GPU default.
+  return os.environ.get('MJX_GPU_DEFAULT_WARP', 'f').lower() == 'true'
+
+
 def _resolve_impl(
     device: jax.Device,
 ) -> types.Impl:
   """Pick a default implementation based on the device specified."""
   if _is_cuda_gpu_device(device):
-    # TODO(btaba): Remove flag once Warp is ready for GPU default.
-    mjx_gpu_default_warp = (
-        os.environ.get('MJX_GPU_DEFAULT_WARP', 'f').lower() == 'true'
-    )
-    if mjx_gpu_default_warp and mjxw.WARP_INSTALLED:
+    if _gpu_default_warp() and mjxw.WARP_INSTALLED:
       logging.debug('Picking default implementation: Warp.')
       return types.Impl.WARP
 
