@@ -513,9 +513,10 @@ class Option(PyTreeNode):
   contact_st_enable: bool
   sensor_softness: float
   sensor_st_enable: bool
-  contact_activeset_softness: float
-  limit_activeset_softness: float
-  frictionloss_activeset_softness: float
+  stickslip_softness: float
+  liftoff_softness: float
+  limit_softness: float
+  frictionloss_softness: float
   refinement_iterations: int
   refinement_ls_iterations: int
   refinement_tolerance: float
@@ -1030,6 +1031,10 @@ class DataJAX(PyTreeNode):
   efc_pos: jax.Array
   efc_margin: jax.Array
   efc_frictionloss: jax.Array
+  # Per-row Jaref length scale of constraint cost smoothing (MJX only):
+  # k * imp * width for contact and limit rows, r * frictionloss for
+  # friction-loss rows. opt.*_softness is a multiple of it.
+  efc_softness_scale: jax.Array
   efc_D: jax.Array  # pylint:disable=invalid-name
   efc_aref: jax.Array
   efc_force: jax.Array

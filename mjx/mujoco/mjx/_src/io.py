@@ -258,9 +258,10 @@ def _put_option(
   fields['sensor_softness'] = float(getattr(o, 'sensor_softness', 0.0))
   fields['sensor_st_enable'] = bool(getattr(o, 'sensor_st_enable', False))
   for name in (
-      'contact_activeset_softness',
-      'limit_activeset_softness',
-      'frictionloss_activeset_softness',
+      'stickslip_softness',
+      'liftoff_softness',
+      'limit_softness',
+      'frictionloss_softness',
   ):
     fields[name] = float(getattr(o, name, 0.0))
   fields['refinement_iterations'] = int(
@@ -712,6 +713,7 @@ def _make_data_jax(
       'efc_pos': (nefc, float_),
       'efc_margin': (nefc, float_),
       'efc_frictionloss': (nefc, float_),
+      'efc_softness_scale': (nefc, float_),
       'efc_D': (nefc, float_),
       'efc_aref': (nefc, float_),
       'efc_force': (nefc, float_),
@@ -1090,6 +1092,10 @@ def _put_data_jax(
       # this happens when M is empty or unstable simulation
       impl_fields['qLD'] = np.zeros((m.nv, m.nv))
     impl_fields['qLDiagInv'] = np.zeros(0)
+
+  # MuJoCo has no counterpart (it needs each row's solimp width); the next
+  # make_constraint recomputes it, so a placeholder of ones is enough here.
+  impl_fields['efc_softness_scale'] = np.ones(nefc)
 
   impl_fields['contact'] = contact
   impl_fields.update(

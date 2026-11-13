@@ -14,6 +14,7 @@
 # ==============================================================================
 """Constraint solvers."""
 
+import functools
 import numbers
 
 import jax
@@ -84,7 +85,8 @@ class Context(PyTreeNode):
       m: Model,
       d: Data,
       grad: bool = True,
-      contact_softness: float = 0.0,
+      stickslip_softness: float = 0.0,
+      liftoff_softness: float = 0.0,
       limit_softness: float = 0.0,
       frictionloss_softness: float = 0.0,
   ) -> 'Context':
@@ -128,7 +130,8 @@ class Context(PyTreeNode):
         h=0.0,
     )
     ctx = _update_constraint(
-        m, d, ctx, contact_softness=contact_softness, limit_softness=limit_softness,
+        m, d, ctx, stickslip_softness=stickslip_softness,
+        liftoff_softness=liftoff_softness, limit_softness=limit_softness,
         frictionloss_softness=frictionloss_softness,
     )
     if grad:
@@ -268,36 +271,44 @@ def _while_loop_scan(cond_fun, body_fun, init_val, max_iter):
   return jax.lax.scan(_fun, init, None, length=max_iter)[0][0]
 
 
-_ACTIVESET_SOFTNESS_FIELDS = (
-    'contact_activeset_softness',
-    'limit_activeset_softness',
-    'frictionloss_activeset_softness',
+_SOFTNESS_FIELDS = (
+    'stickslip_softness',
+    'liftoff_softness',
+    'limit_softness',
+    'frictionloss_softness',
 )
 
 
-def _activeset_softnesses(m: Model) -> tuple[float, float, float]:
-  """Returns the validated active-set smoothing widths as Python floats.
+def _softnesses(m: Model) -> tuple[float, ...]:
+  """Returns the validated softnesses, in ``_SOFTNESS_FIELDS`` order.
 
   The widths select code paths at trace time, so they must be concrete,
-  finite, non-negative scalars (0 disables smoothing).
+  finite, non-negative scalars (0 disables that smoothing).
   """
-  softnesses = []
-  for name in _ACTIVESET_SOFTNESS_FIELDS:
-    value = getattr(m.opt, name)
-    if isinstance(value, jax.Array):
-      # A jax.Array option field is a pytree leaf, so it is traced under jit.
-      raise TypeError(
-          f'opt.{name} must be a Python float, not a jax.Array; it is static '
-          'and selects code paths at trace time.'
-      )
-    try:
-      softness = float(value)
-    except TypeError as e:
-      raise TypeError(f'opt.{name} must be a scalar, got {value!r}.') from e
-    if not (softness >= 0.0 and softness < float('inf')):
-      raise ValueError(f'opt.{name} must be finite and >= 0, got {softness}.')
-    softnesses.append(softness)
-  return tuple(softnesses)
+  return tuple(_static_softness(m, name) for name in _SOFTNESS_FIELDS)
+
+
+def _static_softness(m: Model, name: str) -> float:
+  """Validates one static softness option and returns it as a Python float."""
+  value = getattr(m.opt, name)
+  if isinstance(value, jax.Array):
+    # A jax.Array option field is a pytree leaf, so it is traced under jit.
+    raise TypeError(
+        f'opt.{name} must be a Python float, not a jax.Array; it is static '
+        'and selects code paths at trace time.'
+    )
+  try:
+    softness = float(value)
+  except TypeError as e:
+    raise TypeError(f'opt.{name} must be a scalar, got {value!r}.') from e
+  if not (softness >= 0.0 and softness < float('inf')):
+    raise ValueError(f'opt.{name} must be finite and >= 0, got {softness}.')
+  return softness
+
+
+def _softness_kwargs(softnesses: tuple[float, ...]) -> dict[str, float]:
+  """Softnesses (``_SOFTNESS_FIELDS`` order) as keyword arguments."""
+  return dict(zip(_SOFTNESS_FIELDS, softnesses))
 
 
 def _static_count_option(m: Model, name: str) -> int:
@@ -345,6 +356,24 @@ def _refinement_tolerance(m: Model) -> float:
   return tolerance
 
 
+def _effective_softnesses(m: Model, d: Data) -> tuple[float, ...]:
+  """Active-set softnesses with those of absent row types set to 0.
+
+  Row counts are static, so a softness whose rows do not exist in this model
+  (no contacts, limits or friction loss) is dropped at trace time and cannot
+  trigger a refinement that would leave the hard solution unchanged.
+  """
+  stickslip, liftoff, limit, frictionloss = _softnesses(m)
+  impl = d._impl
+  ncontact_rows = impl.nefc - impl.ne - impl.nf - impl.nl
+  return (
+      stickslip if ncontact_rows else 0.0,
+      liftoff if ncontact_rows else 0.0,
+      limit if impl.nl else 0.0,
+      frictionloss if impl.nf else 0.0,
+  )
+
+
 def _refinement_fallback_enable(m: Model) -> bool:
   """Returns the validated ``opt.refinement_fallback_enable`` (static bool)."""
   value = m.opt.refinement_fallback_enable
@@ -358,32 +387,20 @@ def _refinement_fallback_enable(m: Model) -> bool:
 
 
 
-def _smoothed_linesearch(
-    root, qacc: jax.Array, direction: jax.Array, iterations: int
-) -> jax.Array:
-  """Step size along ``direction`` that minimizes the smoothed cost.
+def _linesearch_1d(derivs, iterations: int, dtype) -> jax.Array:
+  """Step size minimizing a convex 1-D cost given ``derivs(a) = (phi', phi'')``.
 
-  ``root`` is the gradient of a convex cost (the smoothed stationarity
-  residual), so along the line ``phi'(a) = root(q + a p) . p`` is increasing
-  and ``phi''(a) = p^T (d root/d q) p > 0``. Like ``_linesearch``, this is a
-  bracketed Newton iteration on ``phi'``, but it evaluates the smoothed cost's
-  derivatives directly (one JVP per iteration) instead of the hard cost's
-  piecewise-quadratic coefficients.
-
-  Starting from the full Newton step ``a = 1``, it expands (``a <- max(Newton,
-  2a)``) until ``phi'`` changes sign, because on the smoothed residual Newton
-  typically undershoots: rows that switch off along the step lower the
-  curvature, so the minimizer lies beyond ``a = 1``. Once bracketed, it takes
-  Newton steps, bisecting when a Newton step leaves the bracket. If no sign
-  change is found, it returns the furthest point with ``phi' < 0``, which still
-  decreases the cost.
+  ``phi'`` is increasing (the cost is the smoothed convex objective along a
+  Newton direction). Like ``_linesearch``, this is a bracketed Newton
+  iteration on ``phi'``. Starting from the full Newton step ``a = 1``, it
+  expands (``a <- max(Newton, 2a)``) until ``phi'`` changes sign, because on
+  the smoothed residual Newton typically undershoots: rows that switch off
+  along the step lower the curvature, so the minimizer lies beyond ``a = 1``.
+  Once bracketed, it takes Newton steps, bisecting when a Newton step leaves
+  the bracket. If no sign change is found, it returns the furthest point with
+  ``phi' < 0``, which still decreases the cost. With 0 iterations it returns 1.
   """
-  dtype = qacc.dtype
   inf = jp.asarray(jp.inf, dtype)
-
-  def derivs(alpha):
-    r, jr = jax.jvp(root, (qacc + alpha * direction,), (direction,))
-    return jp.dot(r, direction), jp.dot(jr, direction)
 
   def body(_, carry):
     lo, hi, alpha = carry
@@ -392,7 +409,9 @@ def _smoothed_linesearch(
     hi = jp.where(d1 > 0, alpha, hi)
     newton = alpha - d1 / jp.maximum(d2, jp.finfo(dtype).tiny)
     bracketed = jp.isfinite(hi)
-    inside = (newton > lo) & (newton < hi)
+    # Inclusive: once converged, Newton returns the trial point itself, which
+    # sits on a bracket end; a strict test would bisect away from it.
+    inside = (newton >= lo) & (newton <= hi)
     next_bracketed = jp.where(inside, newton, 0.5 * (lo + hi))
     next_expand = jp.maximum(newton, 2 * alpha)
     alpha = jp.where(d1 == 0, alpha, jp.where(bracketed, next_bracketed, next_expand))
@@ -405,6 +424,112 @@ def _smoothed_linesearch(
   return jp.where(jp.isfinite(hi), alpha, jp.maximum(lo, jp.asarray(1.0, dtype)))
 
 
+def _jvp_line_derivs(root, qacc: jax.Array, direction: jax.Array):
+  """``derivs(a) = (phi'(a), phi''(a))`` of ``phi'(a) = root(q + a p) . p``.
+
+  One JVP of ``root`` per call: works for any residual (generic path).
+  """
+
+  def derivs(alpha):
+    r, jr = jax.jvp(root, (qacc + alpha * direction,), (direction,))
+    return jp.dot(r, direction), jp.dot(jr, direction)
+
+  return derivs
+
+
+def _smoothed_linesearch(
+    root, qacc: jax.Array, direction: jax.Array, iterations: int
+) -> jax.Array:
+  """``_linesearch_1d`` along ``direction`` for a generic residual ``root``."""
+  return _linesearch_1d(
+      _jvp_line_derivs(root, qacc, direction), iterations, qacc.dtype
+  )
+
+
+def _jacfwd_newton(root):
+  """Generic Newton system: dense ``jacfwd`` Jacobian, LU solve, JVP line search.
+
+  Works for any residual; the default of ``_refine_smoothed_root``. Returns
+  ``(point, step)`` as described there.
+  """
+
+  def point(qacc):
+    return root(qacc), None
+
+  def step(qacc, state):
+    r, _ = state
+    # The Jacobian is built here, not in point: point also runs once after
+    # the last step (only for r(qacc_eval)), so a Jacobian there would be
+    # wasted (~nv residual evaluations). The cost of this choice is that
+    # jacfwd re-evaluates root(qacc), one extra evaluation per step.
+    direction = -jp.linalg.solve(jax.jacfwd(root)(qacc), r)
+    return direction, _jvp_line_derivs(root, qacc, direction)
+
+  return point, step
+
+
+def _smoothed_newton(
+    m: Model, d: Data, softnesses: tuple[float, ...]
+):
+  """Newton system of the smoothed residual, exact for either cone.
+
+  ``r(q) = M q - qfrc_smooth - J^T f(Jaref)`` with ``Jaref = J q - aref``,
+  and only the constraint force ``f`` is nonlinear. The residual Jacobian
+  ``M - J^T (df/dJaref) J`` therefore needs only ``(df/dJaref) J``: one JVP of
+  ``f`` per column of ``J``, through the force alone (``jacfwd`` of the
+  residual would also push every tangent through ``M``, ``J`` and ``J^T``).
+  ``df/dJaref`` is block diagonal per contact (the per-contact cost couples a
+  pyramidal contact's edge rows; the elliptic cone couples its rows too), and it is symmetric negative semidefinite (``f`` is minus
+  the gradient of the convex constraint cost), so the Jacobian is symmetric
+  positive definite and is solved with Cholesky. Along the direction ``p``,
+  ``J p`` and ``M p`` are computed once, so each line-search trial evaluates
+  ``f`` and one JVP of ``f`` along ``J p`` (no ``nv``-sized products).
+
+  Returns ``(point, step)`` as described in ``_refine_smoothed_root``, with
+  the smoothed ``Context`` as the state.
+  """
+  softness = _softness_kwargs(softnesses)
+  efc_j = d._impl.efc_J
+  m_full = support.full_m(m, d)
+
+  def state_of(ctx):
+    return ctx.Ma - d.qfrc_smooth - ctx.qfrc_constraint, ctx
+
+  def point(qacc):
+    return state_of(
+        Context.create(m, d.replace(qacc=qacc), grad=False, **softness)
+    )
+
+  def step(qacc, state):
+    del qacc  # the context holds everything at qacc
+    r, ctx = state
+
+    def force(jaref):
+      return _update_constraint(m, d, ctx.replace(Jaref=jaref), **softness).efc_force
+
+    def force_jvp(jaref, tangent):
+      return jax.jvp(force, (jaref,), (tangent,))
+
+    df_j = jax.vmap(
+        lambda t: force_jvp(ctx.Jaref, t)[1], in_axes=1, out_axes=1
+    )(efc_j)
+    h = m_full - efc_j.T @ df_j
+    factor = jax.scipy.linalg.cho_factor(0.5 * (h + h.T))
+    direction = -jax.scipy.linalg.cho_solve(factor, r)
+
+    jv = efc_j @ direction
+    c0 = jp.dot(direction, ctx.Ma - d.qfrc_smooth)
+    c1 = jp.dot(direction, support.mul_m(m, d, direction))
+
+    def derivs(alpha):
+      f, df_jv = force_jvp(ctx.Jaref + alpha * jv, jv)
+      return c0 + alpha * c1 - jp.dot(jv, f), c1 - jp.dot(jv, df_jv)
+
+    return direction, derivs
+
+  return point, step
+
+
 def _refine_smoothed_root(
     root,
     qacc_hard: jax.Array,
@@ -413,13 +538,21 @@ def _refine_smoothed_root(
     floor: jax.Array | float = 0.0,
     ls_iterations: int = 0,
     fallback_enable: bool = True,
+    newton=None,
 ) -> tuple[jax.Array, jax.Array]:
   """Line-searched Newton from the hard solution toward the smoothed root.
 
   The result is only the gradient's evaluation point; forward values stay
-  hard. Each Newton step uses ``ls_iterations`` smoothed line-search trials;
-  with 0 the full Newton step is taken (plain Newton, no line search cost).
-  Returns ``(qacc_eval, accepted)``.
+  hard. Each Newton step uses ``ls_iterations`` line-search trials; with 0
+  the full Newton step is taken (plain Newton, no line search cost). Returns
+  ``(qacc_eval, accepted)``.
+
+  ``newton = (point, step)`` defines the Newton system (default:
+  ``_jacfwd_newton(root)``). ``point(q) -> (r(q), aux)`` evaluates the
+  residual and whatever the step reuses at ``q``; ``step(q, state) -> (p,
+  derivs)`` gives the Newton direction and ``derivs(a) = (phi'(a),
+  phi''(a))`` along it. The state is carried through the iterations, so
+  each point is evaluated once, and the last one gives ``r(qacc_eval)``.
 
   With ``fallback_enable`` (the default), the refined point is accepted only if it is
   finite and its smoothed residual satisfies
@@ -431,26 +564,314 @@ def _refine_smoothed_root(
   non-finite points always fall back, since they would only give NaN
   gradients.
   """
+  if iterations == 0:
+    return qacc_hard, jp.asarray(True)
+  point, step = newton if newton is not None else _jacfwd_newton(root)
+  state = point(qacc_hard)
+  r_hard = jp.linalg.norm(state[0])
 
-  def body(qacc, _):
-    direction = -jp.linalg.solve(jax.jacfwd(root)(qacc), root(qacc))
-    alpha = _smoothed_linesearch(root, qacc, direction, ls_iterations)
-    return qacc + alpha * direction, None
+  def body(carry, _):
+    qacc, state = carry
+    direction, derivs = step(qacc, state)
+    alpha = _linesearch_1d(derivs, ls_iterations, qacc.dtype)
+    qacc = qacc + alpha * direction
+    return (qacc, point(qacc)), None
 
-  qacc, _ = jax.lax.scan(body, qacc_hard, None, length=iterations)
-  r_hard = jp.linalg.norm(root(qacc_hard))
-  r_eval = jp.linalg.norm(root(qacc))
+  (qacc, state), _ = jax.lax.scan(
+      body, (qacc_hard, state), None, length=iterations
+  )
+  r_eval = jp.linalg.norm(state[0])
   accepted = jp.isfinite(r_eval) & jp.all(jp.isfinite(qacc))
   if fallback_enable:
     accepted &= r_eval <= jp.maximum(tolerance * r_hard, floor)
   return jp.where(accepted, qacc, qacc_hard), accepted
 
 
+def _relu_per_row(x: jax.Array, tau: jax.Array) -> jax.Array:
+  """``sj.relu(x, tau)`` (smooth, non-gated) with a per-row ``tau``.
+
+  softjax computes ``softness * f(x / softness)``, so this equals
+  ``sj.relu(x, softness=tau)``; it passes a scalar softness because
+  ``sj.relu`` rejects an array softness outside of tracing.
+  """
+  return tau * sj.relu(x / tau, softness=1.0, mode='smooth', gated=False)
+
+
+def _softplus(x: jax.Array) -> jax.Array:
+  """``softplus(x)`` as softjax's smooth, non-gated ``relu`` at unit softness.
+
+  The contact cost's closed forms (``_softplus_integral``, ``_tau_term``) are
+  derived for this kernel, so it is fixed to ``mode='smooth'``.
+  """
+  return sj.relu(x, softness=1.0, mode='smooth', gated=False)
+
+
+_LI2_TERMS = 40
+
+
+def _li2_half(w: jax.Array) -> jax.Array:
+  """Dilogarithm ``Li2(w)`` for ``0 <= w <= 1/2`` by its power series.
+
+  With ``w <= 1/2`` the truncation error of 40 terms is below
+  ``2**-40 / 1600``, under float64 rounding.
+  """
+  k = jp.arange(1, _LI2_TERMS + 1, dtype=w.dtype)
+  return jp.sum(w[..., None] ** k / (k * k), axis=-1)
+
+
+@jax.custom_jvp
+def _softplus_integral(z: jax.Array) -> jax.Array:
+  """``F(z) = integral of softplus from -inf to z = -Li2(-e^z)``.
+
+  ``F' = softplus`` and ``F'' = sigmoid``. For ``z <= 0`` Landen's identity
+  gives ``F(z) = Li2(sigmoid(z)) + softplus(z)**2 / 2`` (series argument at
+  most 1/2); for ``z > 0`` the inversion ``F(z) = pi**2/6 + z**2/2 - F(-z)``
+  reduces to that case.
+  """
+  # where, not minimum/maximum: those split the gradient at 0.
+  neg = jp.where(z <= 0, z, 0.0)
+  pos = jp.where(z > 0, z, 0.0)
+  f_neg = _li2_half(jax.nn.sigmoid(neg)) + 0.5 * _softplus(neg) ** 2
+  f_mpos = _li2_half(jax.nn.sigmoid(-pos)) + 0.5 * _softplus(-pos) ** 2
+  return jp.where(z <= 0, f_neg, jp.pi**2 / 6 + 0.5 * pos * pos - f_mpos)
+
+
+@_softplus_integral.defjvp
+def _softplus_integral_jvp(primals, tangents):
+  (z,), (dz,) = primals, tangents
+  return _softplus_integral(z), _softplus(z) * dz
+
+
+def _tau_term(u: jax.Array) -> jax.Array:
+  """``G(u) = 2 F(u) - u softplus(u) >= 0``, the ``tau``-derivative factor.
+
+  For ``u > 0`` both terms grow like ``u**2`` and cancel to about
+  ``pi**2/3``; the inversion of ``F`` gives the cancellation-free
+  ``G(u) = pi**2/3 - 2 F(-u) - u softplus(-u)``.
+  """
+  neg = jp.where(u <= 0, u, 0.0)
+  pos = jp.where(u > 0, u, 0.0)
+  g_neg = 2.0 * _softplus_integral(neg) - neg * _softplus(neg)
+  g_pos = (
+      jp.pi**2 / 3
+      - 2.0 * _softplus_integral(-pos)
+      - pos * _softplus(-pos)
+  )
+  return jp.where(u <= 0, g_neg, g_pos)
+
+
+def _contact_edge_groups(m: Model) -> list[tuple[int, int, int]]:
+  """Static ``(first_row, num_contacts, rows_per_contact)`` contact blocks.
+
+  ``make_constraint`` lays contact rows out after the equality, friction-loss
+  and limit rows: condim-1 (frictionless) contacts with one row each, then
+  pyramidal condim 3, 4 and 6 contacts with ``2 * (condim - 1)`` edge rows
+  each, every contact's rows consecutive (``make_efc_type``).
+  """
+  # Imported here: constraint imports collision_driver, which imports more of
+  # the package than this module needs at load time.
+  from mujoco.mjx._src import collision_driver  # pylint: disable=g-import-not-at-top
+  from mujoco.mjx._src import constraint  # pylint: disable=g-import-not-at-top
+
+  if m.opt.disableflags & DisableBit.CONTACT:
+    return []
+  efc_type = constraint.make_efc_type(m)
+  ne, nf, nl, _ = constraint.counts(efc_type)
+  dim = collision_driver.make_condim(m)
+  start, groups = int(ne + nf + nl), []
+  for condim in (1, 3, 4, 6):
+    n = int((dim == condim).sum())
+    rows = 1 if condim == 1 else 2 * (condim - 1)
+    if n:
+      groups.append((start, n, rows))
+    start += n * rows
+  if start != efc_type.shape[0]:
+    raise ValueError('contact rows do not match make_efc_type.')
+  return groups
+
+
+def _contact_band_terms(
+    n: jax.Array, scale: jax.Array, slip_softness: float, liftoff_softness: float
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+  """Per-contact band ``tau(n)`` and its first two derivatives in ``n``.
+
+  With ``liftoff_softness > 0``, ``tau(n) = l0 * (1 + softplus(slip * (-n) / l0))``
+  and ``l0 = liftoff_softness * scale / (1 + log 2)``, ``scale = k*imp*width``:
+
+  - at the liftoff switch (``n = 0``) ``tau = liftoff_softness * scale``,
+    ``liftoff_softness`` solimp widths;
+  - separating (``n >> 0``) it settles to the floor ``l0``;
+  - loaded (``-n >> l0 / slip``) ``tau ~ slip_softness * |n|``, a fraction
+    ``slip_softness`` of the contact's load: friction utilization.
+
+  With ``liftoff_softness = 0`` it is the ``l0 -> 0`` limit
+  ``tau = slip_softness * max(-n, 0)``: the same utilization band, and 0 (the
+  hard contact) from liftoff on. With ``slip_softness = 0`` it is the constant
+  ``liftoff_softness * scale``. Non-negative and convex in ``n`` (the second
+  derivative of the ``l0 -> 0`` kink is left out).
+  """
+  if liftoff_softness > 0:
+    l0 = liftoff_softness * scale / (1.0 + jp.log(2.0))
+    z = slip_softness * -n / l0
+    sz = jax.nn.sigmoid(z)
+    tau = l0 * (1.0 + _softplus(z))
+    return tau, -slip_softness * sz, slip_softness**2 / l0 * sz * (1.0 - sz)
+  loaded = n < 0
+  tau = slip_softness * jp.where(loaded, -n, 0.0)
+  return tau, -slip_softness * loaded.astype(n.dtype), jp.zeros_like(n)
+
+
+def _contact_band(
+    n: jax.Array, scale: jax.Array, slip_softness: float, liftoff_softness: float
+) -> jax.Array:
+  """Per-contact band ``tau(n)`` (see ``_contact_band_terms``)."""
+  return _contact_band_terms(n, scale, slip_softness, liftoff_softness)[0]
+
+
+def _contact_cost_force(
+    m: Model,
+    d: Data,
+    jaref: jax.Array,
+    scale: jax.Array,
+    slip_softness: float,
+    liftoff_softness: float,
+) -> jax.Array:
+  """Per-contact smoothed force: minus the gradient of a convex contact cost.
+
+  For a contact with rows ``y_e = Jaref_e`` (pyramid edges ``n +- t``, or one
+  frictionless row) and normal coordinate ``n = mean_e y_e = Jaref_n``:
+
+    ``C(y) = sum_e D_e * h(y_e, tau(n))``,  ``h(y, tau) = tau**2 F(-y / tau)``
+
+  with ``F' = softplus`` and the band ``tau(n)`` of ``_contact_band`` (``l``
+  from ``efc_softness_scale``, held constant). With ``tau`` fixed each term is
+  the per-row force ``D_e * tau * softplus(-y_e / tau)``, and ``tau -> 0``
+  gives the hard ``1/2 D relu(-y)**2``. Stick/slip is smoothed over a fraction
+  ``slip_softness`` of friction utilization and liftoff over
+  ``liftoff_softness`` solimp widths; the two merge for contacts lighter than
+  about ``|n| ~ l0 / slip_softness`` (the slip lines meet at the cone's apex).
+  Either may be 0: ``liftoff_softness = 0`` keeps liftoff hard (``tau = 0``
+  once the contact unloads, where the force is the hard ``D max(0, -y)``),
+  ``slip_softness = 0`` gives a constant band.
+
+  Convexity (``u = -y / tau``, ``F'' = sigmoid``):
+
+  - ``h`` is jointly convex for ``tau > 0``: its Hessian in ``(y, tau)`` is
+    ``[[F'', u F'' - F'], [u F'' - F', 2F - 2u F' + u**2 F'']]`` with
+    determinant ``Q = 2 F F'' - F'**2``; ``Q' = 2 F sigmoid' > 0`` and
+    ``Q(-inf) = 0``, so ``Q > 0``.
+  - ``h`` is increasing in ``tau``: ``dh/dtau = tau G``, ``G = 2F - u F'``;
+    ``G' = softplus(u) - u sigmoid(u) > 0`` (it rises from 0 for ``u < 0``,
+    peaks at ``log 2`` and falls to ``0+`` for ``u > 0``) and ``G(-inf) = 0``,
+    so ``G > 0``.
+  - ``tau`` is non-negative and convex in ``y`` (softplus, or ``max(0, .)``,
+    of an affine function); ``h`` extends continuously to ``tau = 0`` as the
+    hard cost, which keeps both properties.
+
+  A jointly convex function nondecreasing in ``tau``, composed with a convex
+  ``tau``, is convex; so ``C`` is convex, ``f = -grad C`` and the residual
+  Jacobian ``M + J^T (hess C) J`` is symmetric positive definite.
+  """
+  groups = _contact_edge_groups(m)
+  if not groups:
+    return jp.zeros_like(jaref)
+  efc_d = d._impl.efc_D
+  # Contact blocks are contiguous and end the row layout (_contact_edge_groups).
+  parts = [jp.zeros(groups[0][0], jaref.dtype)]
+  for start, ncon, rows in groups:
+    sl = slice(start, start + ncon * rows)
+    force = _contact_group_force(
+        jaref[sl].reshape(ncon, rows), efc_d[sl].reshape(ncon, rows),
+        scale[sl].reshape(ncon, rows)[:, 0], slip_softness, liftoff_softness,
+    )
+    parts.append(force.reshape(-1))
+  return jp.concatenate(parts)
+
+
+# Below this band a contact uses the hard force (the smoothed one differs by
+# O(D * tau)); it keeps -y / tau finite.
+_MIN_BAND = mujoco.mjMINVAL
+
+
+def _contact_group_terms(y, efc_d, ell, slip_softness, liftoff_softness):
+  """Force of one block of contacts (``y``: ``(ncon, rows)``) and the terms
+  its tangent rule reuses. ``F`` is evaluated once, at ``-|u|``; ``F(u)`` and
+  ``G(u) = 2 F(u) - u softplus(u)`` follow by inversion, cancellation-free.
+  Contacts with a zero band (``liftoff_softness = 0``, unloaded) get the hard
+  force."""
+  rows = y.shape[1]
+  n = jp.mean(y, axis=1)
+  tau, dtau, d2tau = _contact_band_terms(n, ell, slip_softness, liftoff_softness)
+  on = tau > _MIN_BAND
+  tau = jp.where(on, tau, 1.0)  # finite u; the off contacts are replaced below
+  tau_c = tau[:, None]
+  u = -y / tau_c
+  pos = u > 0
+  sp, sg = _softplus(u), jax.nn.sigmoid(u)
+  sp_m, sg_m = _softplus(-u), jax.nn.sigmoid(-u)
+  f_m = _softplus_integral(-jp.abs(u))
+  g = jp.where(pos, jp.pi**2 / 3 - 2.0 * f_m - u * sp_m, 2.0 * f_m - u * sp)
+  force = efc_d * tau_c * sp + (
+      -dtau / rows * jp.sum(efc_d * tau_c * g, axis=1)
+  )[:, None]
+  force = jp.where(on[:, None], force, efc_d * jp.where(y < 0, -y, 0.0))
+  return force, (u, pos, sp, sg, sp_m, sg_m, f_m, g, tau, dtau, d2tau, on)
+
+
+@functools.partial(jax.custom_jvp, nondiff_argnums=(3, 4))
+def _contact_group_force(y, efc_d, ell, slip_softness, liftoff_softness):
+  """Per-contact force of one block, with an analytic tangent rule."""
+  return _contact_group_terms(y, efc_d, ell, slip_softness, liftoff_softness)[0]
+
+
+@_contact_group_force.defjvp
+def _contact_group_force_jvp(slip_softness, liftoff_softness, primals, tangents):
+  """``df = -(hess C) dy + f(y; dD)``.
+
+  Per contact, ``hess C`` is the per-row mask ``diag(D sigmoid(u))`` plus a
+  symmetric update along the normal mode ``1`` (``n = mean y``):
+  ``(tau'/N) (a 1^T + 1 a^T) + c 1 1^T`` with ``a_e = D_e d2h/dy dtau =
+  -D_e G'(u_e)``, ``c = (tau'/N)^2 sum D d2h/dtau2 + tau''/N^2 sum D tau G``;
+  a contact with a zero band has the hard mask ``diag(D [y < 0])``.
+  The force is linear in ``D``, so its ``D`` tangent is the force at ``dD``.
+  ``ell`` is held constant (``stop_gradient`` upstream).
+  """
+  y, efc_d, ell = primals
+  dy, d_efc_d, _ = tangents
+  force, (u, pos, sp, sg, sp_m, sg_m, f_m, g, tau, dtau, d2tau, on) = (
+      _contact_group_terms(y, efc_d, ell, slip_softness, liftoff_softness)
+  )
+  rows = y.shape[1]
+  g1 = jp.where(pos, sp_m + u * sg_m, sp - u * sg)             # G'(u)
+  h_tt = jp.where(                                             # d2h / dtau2
+      pos,  # u * (u * s): u * u overflows for a vanishing band
+      jp.pi**2 / 3 - 2.0 * f_m - 2.0 * u * sp_m - u * (u * sg_m),
+      2.0 * f_m - 2.0 * u * sp + u * (u * sg),
+  )
+  a = -efc_d * g1
+  one_dy = jp.sum(dy, axis=1)
+  a_dy = jp.sum(a * dy, axis=1)
+  c = (dtau / rows) ** 2 * jp.sum(efc_d * h_tt, axis=1) + d2tau / rows**2 * jp.sum(
+      efc_d * tau[:, None] * g, axis=1
+  )
+  hess_dy = (
+      efc_d * sg * dy
+      + (dtau / rows)[:, None] * (a * one_dy[:, None] + a_dy[:, None])
+      + (c * one_dy)[:, None]
+  )
+  hess_dy = jp.where(on[:, None], hess_dy, efc_d * (y < 0) * dy)
+  d_force = -hess_dy + _contact_group_terms(
+      y, d_efc_d, ell, slip_softness, liftoff_softness
+  )[0]
+  return force, d_force
+
+
 def _update_constraint(
     m: Model,
     d: Data,
     ctx: Context,
-    contact_softness: float = 0.0,
+    stickslip_softness: float = 0.0,
+    liftoff_softness: float = 0.0,
     limit_softness: float = 0.0,
     frictionloss_softness: float = 0.0,
 ) -> Context:
@@ -462,17 +883,26 @@ def _update_constraint(
     m: model defining constraints
     d: data which contains latest qacc and smooth terms
     ctx: current solver context
-    contact_softness: if > 0, the force of nominal contact rows (in contact,
-      ``efc_pos < efc_margin``) uses ``D * sj.relu(-Jaref, softness)`` (smooth,
-      non-gated: ``softness * softplus(-Jaref / softness)``, slope ``sigmoid``) instead
-      of ``D * max(0, -Jaref)``. Used only by the IFT residual (``_root``), so
-      the forward solve is unchanged; pyramidal cone only. Non-gated on
-      purpose: the gated ``x * sigmoid(x)`` has negative slopes, which can make
-      the IFT residual Jacobian indefinite.
+    stickslip_softness: if this or ``liftoff_softness`` is > 0, the force of
+      nominal contacts (in contact, ``efc_pos < efc_margin``) is minus the
+      gradient of a smoothed convex per-contact cost (``_contact_cost_force``)
+      instead of ``D * max(0, -Jaref)``: stick/slip is smoothed over a fraction
+      ``stickslip_softness`` of friction utilization at any load. Used only by the IFT residual (``_root``), so the forward solve is
+      unchanged; pyramidal cone only. Built on the non-gated softplus: the
+      gated ``x * sigmoid(x)`` has negative slopes, which can make the IFT
+      residual Jacobian indefinite.
+    liftoff_softness: liftoff band of that cost, in solimp widths (0 keeps
+      liftoff hard).
     limit_softness: if > 0, engaged joint/tendon limit rows (``efc_pos < efc_margin``)
-      use ``D * sj.relu(-Jaref, softness)`` (IFT residual only).
+      use ``D * _relu_per_row(-Jaref, tau)`` (IFT residual only).
     frictionloss_softness: if > 0, friction-loss rows use a smooth clip of
       ``-Jaref`` to ``[-r f, r f]`` instead of the hard clip (IFT residual only).
+
+    Each softness is dimensionless, in the row's own Jaref scale
+    ``efc_softness_scale`` (see ``constraint.make_constraint``): limit and
+    friction-loss rows use ``tau = softness * efc_softness_scale``; contacts
+    use it as the liftoff length of their cost. The scale is held constant
+    (``stop_gradient``) so it adds no gradient of its own.
 
   Returns:
     context with new constraint force and costs
@@ -483,6 +913,8 @@ def _update_constraint(
   # ne constraints are always active, nf are conditionally active, others are
   # non-negative constraints.
   active = (ctx.Jaref < 0).at[: d._impl.ne + d._impl.nf].set(True)
+  # Per-row Jaref scale of the constraint cost smoothing bands (constant).
+  scale = jax.lax.stop_gradient(d._impl.efc_softness_scale)
 
   floss_force, floss_cost = jp.zeros(d._impl.nefc), 0.0
   dof_fl, ten_fl = m._impl.dof_hasfrictionloss, m._impl.tendon_hasfrictionloss
@@ -503,19 +935,23 @@ def _update_constraint(
     efc_force = d._impl.efc_D * -ctx.Jaref * active + floss_force
     cost = 0.5 * jp.sum(d._impl.efc_D * ctx.Jaref * ctx.Jaref * active)
     dm, u, h = 0.0, 0.0, 0.0
-    if contact_softness > 0:
+    if stickslip_softness > 0 or liftoff_softness > 0:
       # Smooth the Jaref mask (liftoff, stick/slip) of nominal contact rows only:
       # pw_solimp rows (efc_pos >= efc_margin) and padding rows keep the hard mask.
       nominal = (d._impl.efc_type >= ConstraintType.CONTACT_FRICTIONLESS) & (
           d._impl.efc_pos < d._impl.efc_margin
       )
-      smooth_force = d._impl.efc_D * sj.relu(
-          -ctx.Jaref, softness=contact_softness, mode='smooth', gated=False
+      # A contact's rows share efc_pos, so nominal selects whole contacts and
+      # the per-contact force stays a gradient.
+      smooth_force = _contact_cost_force(
+          m, d, ctx.Jaref, scale, stickslip_softness, liftoff_softness
       )
       efc_force = jp.where(nominal, smooth_force, efc_force)
   elif m.opt.cone == ConeType.ELLIPTIC:
-    if contact_softness > 0:
-      raise NotImplementedError('contact_activeset_softness requires the pyramidal cone.')
+    if stickslip_softness > 0 or liftoff_softness > 0:
+      raise NotImplementedError(
+          'stickslip_softness and liftoff_softness require the pyramidal cone.'
+      )
     friction = d._impl.contact.friction[d._impl.contact.dim > 1]
     efc_address = d._impl.contact.efc_address[d._impl.contact.dim > 1]
     dim = d._impl.contact.dim[d._impl.contact.dim > 1]
@@ -583,9 +1019,7 @@ def _update_constraint(
         d._impl.efc_type == ConstraintType.LIMIT_TENDON
     )
     engaged = is_limit & (d._impl.efc_pos < d._impl.efc_margin)
-    smooth_force = d._impl.efc_D * sj.relu(
-        -ctx.Jaref, softness=limit_softness, mode='smooth', gated=False
-    )
+    smooth_force = d._impl.efc_D * _relu_per_row(-ctx.Jaref, limit_softness * scale)
     efc_force = jp.where(engaged, smooth_force, efc_force)
   if frictionloss_softness > 0:
     # Smooth clip of x = -Jaref to [-b, b], b = r * f (the stick/slip threshold in Jaref units).
@@ -596,10 +1030,11 @@ def _update_constraint(
     r = 1.0 / (d._impl.efc_D + (d._impl.efc_D == 0.0) * mujoco.mjMINVAL)
     b = r * d._impl.efc_frictionloss
     x = -ctx.Jaref
+    tau = frictionloss_softness * scale
     soft_clip = (
         x
-        - sj.relu(x - b, softness=frictionloss_softness, mode='smooth', gated=False)
-        + sj.relu(-x - b, softness=frictionloss_softness, mode='smooth', gated=False)
+        - _relu_per_row(x - b, tau)
+        + _relu_per_row(-x - b, tau)
     )
     efc_force = jp.where(is_fl, d._impl.efc_D * soft_clip, efc_force)
 
@@ -922,26 +1357,19 @@ def _solve_scan(m: Model, d: Data) -> Data:
 
 def _root(m: Model, d: Data, qacc: jax.Array) -> jax.Array:
   """Stationarity residual ``M qacc - qfrc_smooth - qfrc_constraint``."""
-  contact_softness, limit_softness, frictionloss_softness = _activeset_softnesses(m)
   ctx = Context.create(
-      m,
-      d.replace(qacc=qacc),
-      grad=False,
-      contact_softness=contact_softness,
-      limit_softness=limit_softness,
-      frictionloss_softness=frictionloss_softness,
+      m, d.replace(qacc=qacc), grad=False, **_softness_kwargs(_softnesses(m))
   )
   return ctx.Ma - d.qfrc_smooth - ctx.qfrc_constraint
 
 
-def _root_iterative_solve(
-    m: Model, d: Data, qacc: jax.Array
-) -> tuple[jax.Array, jax.Array]:
-  """Runs the solver to convergence; returns (qacc, realised iterations).
+def _root_iterative_ctx(m: Model, d: Data, qacc: jax.Array) -> Context:
+  """Runs the solver to convergence from ``qacc``; returns the final context.
 
   This solve is never differentiated, so it uses the masked scan rather than
   ``lax.while_loop``, which is slow on GPU; results and iteration counts are
-  identical to the while loop.
+  identical to the while loop. The context's ``Ma`` and ``qfrc_constraint``
+  are those of the returned ``qacc``.
   """
   d = d.replace(qacc=qacc)
   ctx = Context.create(m, d)
@@ -953,85 +1381,102 @@ def _root_iterative_solve(
     return _solver_step(m, d, ctx)
 
   if m.opt.iterations == 1:
-    ctx = body(ctx)
-  else:
-    ctx = _while_loop_scan(cond, body, ctx, max_iter=m.opt.iterations)
+    return body(ctx)
+  return _while_loop_scan(cond, body, ctx, max_iter=m.opt.iterations)
 
+
+def _solver_niter(ctx: Context, dtype) -> jax.Array:
   # Float, not int: custom_root's JVP gives integer aux outputs an integer
   # tangent, which JAX rejects (integer tangents must be float0).
-  return ctx.qacc, jp.asarray(ctx.solver_niter, dtype=qacc.dtype)
+  return jp.asarray(ctx.solver_niter, dtype=dtype)
 
 
-def _root_tangent_solve(g, y):
-  """Solves ``g(x) = y`` for the linear map ``g`` of the residual Jacobian.
+def _ift_factor(m: Model, d: Data, qacc: jax.Array, softnesses) -> tuple:
+  """Cholesky factor of the residual Jacobian ``dr/dqacc`` at ``qacc``.
 
-  ``custom_root`` reverse-differentiates by transposing this function in
-  ``y``, so it must be exactly linear in ``y`` (rules out iterative solves).
+  ``r(q) = M q - qfrc_smooth - J^T f(J q - aref)`` and only the constraint
+  force is nonlinear, so ``dr/dq = M - J^T (df/dJaref) J``: ``(df/dJaref) J``
+  takes one JVP of the force per column of ``J``, without pushing tangents
+  through ``M``, ``J`` and ``J^T``. It is symmetric positive definite (the
+  force is minus the gradient of the convex constraint cost), so Cholesky.
   """
-  # g is linear, so applying it to the identity columns gives its matrix.
-  eye = jp.eye(y.shape[0], dtype=y.dtype)
-  a = jax.vmap(g, out_axes=1)(eye)
-  return jp.linalg.solve(a, y)
+  softness = _softness_kwargs(softnesses)
+  ctx = Context.create(m, d.replace(qacc=qacc), grad=False, **softness)
+  efc_j = d._impl.efc_J
+
+  def force(jaref):
+    return _update_constraint(m, d, ctx.replace(Jaref=jaref), **softness).efc_force
+
+  df_j = jax.vmap(
+      lambda t: jax.jvp(force, (ctx.Jaref,), (t,))[1], in_axes=1, out_axes=1
+  )(efc_j)
+  h = support.full_m(m, d) - efc_j.T @ df_j
+  return jax.scipy.linalg.cho_factor(0.5 * (h + h.T))
+
+
+def _residual_floor(d: Data, ctx: Context) -> jax.Array:
+  """Precision floor of ``|Ma - qfrc_smooth - qfrc_constraint|`` at ``ctx``.
+
+  The residual cannot be resolved below the rounding error of the
+  cancellation between its terms.
+  """
+  scale = (
+      jp.linalg.norm(ctx.Ma)
+      + jp.linalg.norm(d.qfrc_smooth)
+      + jp.linalg.norm(ctx.qfrc_constraint)
+  )
+  return 64 * jp.finfo(ctx.qacc.dtype).eps * scale
 
 
 def _solve_ift(m: Model, d: Data) -> Data:
   """Finds forces using a custom-root implicit gradient.
 
-  With active-set smoothing on and ``opt.refinement_iterations > 0``, the
-  gradient is evaluated at the smoothed residual's root (reached by Newton
-  iterations from the hard solution) instead of at the hard solution, while
-  the forward value stays the hard solution (straight-through).
+  The hard solve (and, with constraint cost smoothing on and
+  ``opt.refinement_iterations > 0``, Newton refinement toward the smoothed
+  residual's root) runs first, without gradients; ``custom_root`` then only
+  supplies the implicit derivative at that point, solved with the Cholesky
+  factor of the residual Jacobian built from force JVPs (``_ift_factor``).
+  With refinement the forward value stays the hard solution and the
+  derivative is that of the smoothed root (straight-through).
   """
   _check_jax_impl(m)
 
-  qacc_guess = _warmstart_qacc(m, d)
-  root = lambda qacc: _root(m, d, qacc)
   iterations = _refinement_iterations(m)
-  # With every softness 0 the smoothed root is the hard solution: skip.
-  refine = iterations > 0 and any(s > 0 for s in _activeset_softnesses(m))
+  softnesses = _effective_softnesses(m, d)
+  # With every (effective) softness 0 the smoothed root is the hard solution.
+  refine = iterations > 0 and any(s > 0 for s in softnesses)
 
-  if not refine:
-    solve_hard = lambda _, qacc: _root_iterative_solve(m, d, qacc)
-    # The iteration count is auxiliary output (not differentiated) so callers
-    # can see how many iterations the forward solve actually needed.
-    qacc, solver_niter = jax.lax.custom_root(
-        root, qacc_guess, solve_hard, _root_tangent_solve, has_aux=True
+  d_const = jax.tree_util.tree_map(jax.lax.stop_gradient, d)
+  ctx_hard = _root_iterative_ctx(m, d_const, _warmstart_qacc(m, d_const))
+  qacc_hard = ctx_hard.qacc
+  # The iteration count is reported, not differentiated.
+  solver_niter = _solver_niter(ctx_hard, qacc_hard.dtype)
+  qacc_eval = qacc_hard
+  if refine:
+    # The smoothed state at q* is evaluated fresh, not built from the forward
+    # solve's incrementally updated Jaref and Ma: that saved no measurable
+    # time and made k = 1 refinement less accurate.
+    qacc_eval, _ = _refine_smoothed_root(
+        lambda qacc: _root(m, d_const, qacc), qacc_hard, iterations,
+        _refinement_tolerance(m), _residual_floor(d_const, ctx_hard),
+        _refinement_ls_iterations(m), _refinement_fallback_enable(m),
+        _smoothed_newton(m, d_const, softnesses),
     )
-  else:
-
-    tolerance = _refinement_tolerance(m)
-    ls_iterations = _refinement_ls_iterations(m)
-    fallback_enable = _refinement_fallback_enable(m)
-
-    def solve_refined(_, qacc):
-      qacc_hard, niter = _root_iterative_solve(m, d, qacc)
-      # Residual precision floor: cancellation in Ma - qfrc_smooth - qfrc_con.
-      ctx_hard = Context.create(m, d.replace(qacc=qacc_hard), grad=False)
-      scale = (
-          jp.linalg.norm(ctx_hard.Ma)
-          + jp.linalg.norm(d.qfrc_smooth)
-          + jp.linalg.norm(ctx_hard.qfrc_constraint)
-      )
-      floor = 64 * jp.finfo(qacc_hard.dtype).eps * scale
-      qacc_eval, _ = _refine_smoothed_root(
-          root, qacc_hard, iterations, tolerance, floor, ls_iterations,
-          fallback_enable,
-      )
-      # The hard solution rides along as aux, so it is not solved twice.
-      return qacc_eval, (niter, qacc_hard)
-
-    qacc_eval, (solver_niter, qacc_hard) = jax.lax.custom_root(
-        root, qacc_guess, solve_refined, _root_tangent_solve, has_aux=True
-    )
+  factor = _ift_factor(m, d_const, qacc_eval, softnesses)
+  # custom_root differentiates the residual in d at qacc_eval; the tangent
+  # system is solved with the factor (linear in y, so reverse mode transposes
+  # it; the matrix is symmetric).
+  qacc = jax.lax.custom_root(
+      lambda qacc: _root(m, d, qacc), qacc_eval, lambda _, x: x,
+      lambda _, y: jax.scipy.linalg.cho_solve(factor, y),
+  )
+  if refine:
     # Value of the hard solution, derivative of the smoothed root.
-    qacc = jax.lax.stop_gradient(qacc_hard) + (
-        qacc_eval - jax.lax.stop_gradient(qacc_eval)
-    )
+    qacc = jax.lax.stop_gradient(qacc_hard) + (qacc - jax.lax.stop_gradient(qacc))
   d = d.replace(qacc=qacc)
   ctx = Context.create(m, d, grad=False).replace(solver_niter=solver_niter)
 
   return _finish_solve(d, ctx)
-
 
 
 _BACKENDS = {
@@ -1080,32 +1525,36 @@ def solve(m: Model, d: Data) -> Data:
   - ``ift`` (default): implicit-function-theorem gradient via
     ``lax.custom_root``. The forward value equals the ``while`` solve
     (computed with a masked scan); the backward pass solves the adjoint of
-    the stationarity residual with a dense LU factorization. The gradient is that of the converged fixed
+    the stationarity residual with a Cholesky factorization of its Jacobian
+    (``_ift_factor``). The gradient is that of the converged fixed
     point, so it differs from the truncated solve when the forward solve
     stops before convergence (e.g. ``opt.iterations == 1``).
 
   For every backend the line search loop is selected by ``opt.scan_loop``.
 
-  The active-set smoothing options (``opt.contact_activeset_softness``,
-  ``opt.limit_activeset_softness``, ``opt.frictionloss_activeset_softness``) only act in the
+  The constraint cost smoothing options (``opt.stickslip_softness``,
+  ``opt.liftoff_softness``, ``opt.limit_softness``,
+  ``opt.frictionloss_softness``) only act in the
   ``ift`` backward pass; enabling one with another backend raises instead of
   being silently ignored. ``opt.refinement_iterations`` (Newton
   iterations to the smoothed root, where the gradient is then evaluated) only
   acts when some softness is > 0.
   """
   backend = grad_backend(m)
-  softnesses = _activeset_softnesses(m)
+  softnesses = _softnesses(m)
   _refinement_iterations(m)  # validate on every backend
   _refinement_tolerance(m)
   _refinement_ls_iterations(m)
   _refinement_fallback_enable(m)
   if backend != 'ift' and any(softness > 0 for softness in softnesses):
-    enabled = [n for n, t in zip(_ACTIVESET_SOFTNESS_FIELDS, softnesses) if t > 0]
+    enabled = [n for n, t in zip(_SOFTNESS_FIELDS, softnesses) if t > 0]
     raise ValueError(
         f'{", ".join(enabled)} > 0 requires the ift gradient backend '
         f'(opt.grad_backend; got {backend!r}); active-set '
         'smoothing only acts in the IFT backward pass.'
     )
-  if softnesses[0] > 0 and m.opt.cone != ConeType.PYRAMIDAL:
-    raise NotImplementedError('contact_activeset_softness requires the pyramidal cone.')
+  if (softnesses[0] > 0 or softnesses[1] > 0) and m.opt.cone != ConeType.PYRAMIDAL:
+    raise NotImplementedError(
+        'stickslip_softness and liftoff_softness require the pyramidal cone.'
+    )
   return _BACKENDS[backend](m, d)
