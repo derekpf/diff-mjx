@@ -752,6 +752,8 @@ def _contact_cost_force(
 ) -> jax.Array:
   """Per-contact smoothed force: minus the gradient of a convex contact cost.
 
+  Elliptic-cone contacts (condim > 1) use ``_elliptic_group_force``; the
+  rest of this docstring describes pyramidal and frictionless contacts.
   For a contact with rows ``y_e = Jaref_e`` (pyramid edges ``n +- t``, or one
   frictionless row) and normal coordinate ``n = mean_e y_e = Jaref_n``:
 
