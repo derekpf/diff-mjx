@@ -118,18 +118,16 @@ inputs. These defaults stay unchanged.
 
 ## Constraint-solver derivative backends
 
-The JAX constraint solver can be differentiated in several ways, selected by the `MJX_GRAD_BACKEND` environment variable. The forward physics (MJX's convex Gauss-principle solve, Newton or CG, pyramidal or elliptic cones) is the same for every backend; only the gradient differs. Ported from [calumarnott/mujoco](https://github.com/calumarnott/mujoco) (`3.9.0-derivatives`, Layeghi et al., [arXiv:2607.24959](https://arxiv.org/abs/2607.24959)) and adapted to this fork.
+The JAX constraint solver can be differentiated in several ways, selected per model by the static option `opt.grad_backend`. The forward physics (MJX's convex Gauss-principle solve, Newton or CG, pyramidal or elliptic cones) is the same for every backend; only the gradient differs. Ported from [calumarnott/mujoco](https://github.com/calumarnott/mujoco) (`3.9.0-derivatives`, Layeghi et al., [arXiv:2607.24959](https://arxiv.org/abs/2607.24959)) and adapted to this fork.
 
-| `MJX_GRAD_BACKEND` | forward loop | gradient |
+| backend | forward loop | gradient |
 |---|---|---|
-| unset / `ift` | masked scan, never differentiated | implicit function theorem on the stationarity residual |
-| `unrolled` | masked scan (`opt.scan_loop=True`, freezes after convergence) or `while_loop` | unrolled through the iterations; the diff-mjx behavior before `ift` became the default |
+| `ift` (default) | masked scan, never differentiated | implicit function theorem on the stationarity residual |
+| `unrolled` | masked scan (`opt.scan_loop=True`, freezes after convergence) or `while_loop` | unrolled through the iterations |
 | `while` | `lax.while_loop` | reverse mode only for `opt.iterations == 1` (upstream MJX) |
 | `scan` | exactly `opt.iterations` steps, no convergence check | unrolled through every step |
 
-`ift` is the default. Set `MJX_GRAD_BACKEND=unrolled` to restore the previous unrolled gradient. Results recorded before this change call the unrolled backend `default`.
-
-The variable is read when a function is **traced**, so set it before `jax.jit` traces (or compiles) the function; already-compiled functions keep their backend.
+**Selecting the backend.** Set `opt.grad_backend` on the model, for example `mx.replace(opt=mx.opt.replace(grad_backend='unrolled'))` or forlax's `DiffEnvWrapper(env, grad_backend='unrolled')`. It defaults to `ift`. The choice belongs to the model, so models in one process can use different backends. Names are case-insensitive. An unknown name raises `ValueError`, and a non-string value (including `None` or a `jax.Array`, which would be traced) raises `TypeError`. The choice is made at trace time, so already-compiled functions keep the backend they were traced with.
 
 **`ift` implementation.** At the solution, `F(a) = M a - qfrc_smooth - qfrc_constraint(a) = 0`. `lax.custom_root` runs the existing solver (`_root_iterative_solve`) to obtain `a*` without recording it for differentiation, then for the backward pass solves the adjoint system `(dF/da)^T λ = dL/da` and returns `-λ^T dF/dθ`, where `θ` is everything `F` depends on (state, controls, model parameters, constraint Jacobians and impedances, including any softjax/ST surrogates computed before the solve).
 
@@ -188,7 +186,7 @@ Its slope is `D_i * sigmoid(-Jaref_i / softness)`. Near a switch, the gradient b
 - **Cone smoothing.** Only linear (per-row) switches are smoothed. Pyramidal contacts are linear rows, so `cone="pyramidal"` is covered. Elliptic cones switch zones (stick, slip, separate) through a coupled per-contact projection onto a second-order cone. That needs a different formulation, with care where the tangential magnitude is zero. Setting `contact_activeset_softness > 0` with `cone="elliptic"` raises `NotImplementedError`. Every registered diff-playground environment uses the pyramidal cone.
 - **Limit touchdown.** Limit engagement is not smoothed. A row only exists once a joint or tendon reaches its limit margin, and it switches on at full impedance with `aref = -b * v`, so an approaching limit still gets a force jump. `limit_activeset_softness` covers only the release of an engaged limit. pw_solimp anticipates contact touchdown only and does not apply to limits.
 - **Contact touchdown is left to pw_solimp.** This is not handled by active-set smoothing. pw_solimp rows (`efc_pos >= efc_margin`) and zeroed padding rows keep the hard mask, so the two mechanisms do not overlap. Under `contact_st_enable`, gradients come from the pw_solimp branch. Smoothing applies to that branch's nominal rows, whose definition is identical to the nominal branch's.
-- **Other backends.** Only `ift` reads these options. Setting any of them above 0 with `MJX_GRAD_BACKEND` set to `unrolled`, `scan`, or `while` raises an error instead of being ignored.
+- **Other backends.** Only `ift` reads these options. Setting any of them above 0 with the `unrolled`, `scan`, or `while` backend raises an error instead of being ignored.
 
 **Usage.**
 

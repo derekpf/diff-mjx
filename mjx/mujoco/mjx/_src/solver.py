@@ -15,7 +15,6 @@
 """Constraint solvers."""
 
 import numbers
-import os
 
 import jax
 from jax import numpy as jp
@@ -1034,7 +1033,6 @@ def _solve_ift(m: Model, d: Data) -> Data:
   return _finish_solve(d, ctx)
 
 
-_DEFAULT_BACKEND = 'ift'
 
 _BACKENDS = {
     'unrolled': _solve_unrolled,
@@ -1044,25 +1042,32 @@ _BACKENDS = {
 }
 
 
-def grad_backend() -> str:
-  """Returns the solver backend selected by ``MJX_GRAD_BACKEND``."""
-  backend = (
-      os.environ.get('MJX_GRAD_BACKEND', '').strip().lower()
-      or _DEFAULT_BACKEND
-  )
+def grad_backend(m: Model) -> str:
+  """Returns ``m.opt.grad_backend``, validated (case-insensitive).
+
+  The option is static: a string from ``_BACKENDS`` (default ``'ift'``).
+  """
+  value = m.opt.grad_backend
+  if not isinstance(value, str):
+    raise TypeError(
+        f'opt.grad_backend must be a str, got {value!r}; it is static and '
+        'selects the solver at trace time.'
+    )
+  backend = value.lower()
   if backend not in _BACKENDS:
     raise ValueError(
-        f'unsupported MJX_GRAD_BACKEND={backend!r}; expected one of '
+        f'unsupported opt.grad_backend={value!r}; expected one of '
         f'{", ".join(_BACKENDS)}'
     )
   return backend
 
 
 def solve(m: Model, d: Data) -> Data:
-  """Finds constraint forces, selecting the solver via ``MJX_GRAD_BACKEND``.
+  """Finds constraint forces with the gradient backend from ``grad_backend``.
 
-  ``MJX_GRAD_BACKEND`` is read at trace time, so already-compiled functions
-  keep the backend they were traced with:
+  The backend is ``opt.grad_backend`` (default ``ift``). It is chosen at
+  trace time, so already-compiled functions keep the backend they were traced
+  with:
 
   - ``unrolled``: the diff-mjx solver, differentiated through its
     iterations. With ``opt.scan_loop`` (the default) the outer loop is a
@@ -1072,7 +1077,7 @@ def solve(m: Model, d: Data) -> Data:
     when ``m.opt.iterations == 1``.
   - ``scan``: fixed-depth unroll of exactly ``opt.iterations`` steps with no
     convergence check; differentiates through every step.
-  - unset or ``ift``: implicit-function-theorem gradient via
+  - ``ift`` (default): implicit-function-theorem gradient via
     ``lax.custom_root``. The forward value equals the ``while`` solve
     (computed with a masked scan); the backward pass solves the adjoint of
     the stationarity residual with a dense LU factorization. The gradient is that of the converged fixed
@@ -1088,7 +1093,7 @@ def solve(m: Model, d: Data) -> Data:
   iterations to the smoothed root, where the gradient is then evaluated) only
   acts when some softness is > 0.
   """
-  backend = grad_backend()
+  backend = grad_backend(m)
   softnesses = _activeset_softnesses(m)
   _refinement_iterations(m)  # validate on every backend
   _refinement_tolerance(m)
@@ -1097,8 +1102,9 @@ def solve(m: Model, d: Data) -> Data:
   if backend != 'ift' and any(softness > 0 for softness in softnesses):
     enabled = [n for n, t in zip(_ACTIVESET_SOFTNESS_FIELDS, softnesses) if t > 0]
     raise ValueError(
-        f'{", ".join(enabled)} > 0 requires MJX_GRAD_BACKEND=ift (got '
-        f'{backend!r}); active-set smoothing only acts in the IFT backward pass.'
+        f'{", ".join(enabled)} > 0 requires the ift gradient backend '
+        f'(opt.grad_backend; got {backend!r}); active-set '
+        'smoothing only acts in the IFT backward pass.'
     )
   if softnesses[0] > 0 and m.opt.cone != ConeType.PYRAMIDAL:
     raise NotImplementedError('contact_activeset_softness requires the pyramidal cone.')

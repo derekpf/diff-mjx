@@ -14,9 +14,6 @@
 # ==============================================================================
 """Tests for contact_activeset_softness: IFT-only smoothing of the contact Jaref mask."""
 
-import os
-from unittest import mock
-
 from absl.testing import absltest
 import jax
 from jax import numpy as jp
@@ -64,14 +61,6 @@ def _model(softness: float, pw_solimp=None) -> mjx.Model:
   return mx.replace(opt=opt)
 
 
-def _with_ift(fn):
-  def wrapped(*args, **kwargs):
-    with mock.patch.dict(os.environ, {'MJX_GRAD_BACKEND': 'ift'}, clear=False):
-      return fn(*args, **kwargs)
-  return wrapped
-
-
-@_with_ift
 def _slope(mx: mjx.Model, dx: mjx.Data, dof: int, forces: np.ndarray) -> np.ndarray:
   """d qacc[dof] / d qfrc_applied[dof] over a sweep of applied forces."""
 
@@ -94,7 +83,6 @@ class ContactActivesetSoftnessTest(absltest.TestCase):
     self.d = _resting_data(m)
     self.dx = mjx.put_data(m, self.d)
 
-  @_with_ift
   def test_softness_zero_matches_default(self):
     """softness=0 (explicit) gives bit-identical forward values and gradients."""
     m = mujoco.MjModel.from_xml_string(_BOX_XML)
@@ -109,7 +97,6 @@ class ContactActivesetSoftnessTest(absltest.TestCase):
     g_zero = jax.grad(lambda v: loss(mx_zero, v))(self.dx.qvel + 0.1)
     np.testing.assert_array_equal(g_default, g_zero)
 
-  @_with_ift
   def test_forward_unchanged(self):
     """softness>0 leaves forward qacc and efc_force unchanged."""
     d = self.dx.replace(qfrc_applied=self.dx.qfrc_applied.at[0].set(3.0))
@@ -145,7 +132,6 @@ class ContactActivesetSoftnessTest(absltest.TestCase):
     self.assertLess(errs[2], errs[0])
     np.testing.assert_allclose(_slope(_model(1e-3), self.dx, 0, forces), hard, atol=1e-3, rtol=1e-3)
 
-  @_with_ift
   def test_pw_solimp_rows_untouched(self):
     """A separated contact within pw_solimp width is only a pw_solimp row; softness must not change it."""
     pw = [0.0, 0.4, 1.0, 1.0, 10.0]
@@ -170,19 +156,19 @@ class ContactActivesetSoftnessTest(absltest.TestCase):
     mx = mx.replace(opt=mx.opt.replace(contact_activeset_softness=1.0))
     dx = mjx.put_data(m, _resting_data(m))
     with self.assertRaises(NotImplementedError):
-      _with_ift(jax.grad(lambda v: jp.sum(mjx.forward(mx, dx.replace(qvel=v)).qacc)))(dx.qvel)
+      jax.grad(lambda v: jp.sum(mjx.forward(mx, dx.replace(qvel=v)).qacc))(dx.qvel)
 
   def test_non_ift_backend_raises(self):
-    with mock.patch.dict(os.environ, {'MJX_GRAD_BACKEND': 'unrolled'}):
-      with self.assertRaisesRegex(ValueError, 'MJX_GRAD_BACKEND=ift'):
-        mjx.forward(_model(0.1), self.dx)
-      mjx.forward(_model(0.0), self.dx)  # softness=0 is fine on any backend
+    unrolled = lambda mx: mx.replace(opt=mx.opt.replace(grad_backend='unrolled'))
+    with self.assertRaisesRegex(ValueError, 'ift gradient backend'):
+      mjx.forward(unrolled(_model(0.1)), self.dx)
+    mjx.forward(unrolled(_model(0.0)), self.dx)  # softness=0 is fine on any backend
 
   def test_invalid_softness_raises(self):
     with self.assertRaisesRegex(ValueError, 'finite and >= 0'):
-      _with_ift(mjx.forward)(_model(-0.1), self.dx)
+      mjx.forward(_model(-0.1), self.dx)
     with self.assertRaisesRegex(TypeError, 'Python float'):
-      _with_ift(mjx.forward)(_model(jp.asarray(0.1)), self.dx)
+      mjx.forward(_model(jp.asarray(0.1)), self.dx)
 
 
 _HINGE_XML = """
@@ -240,7 +226,6 @@ class LimitAndFrictionlossActivesetSoftnessTest(absltest.TestCase):
     self.assertGreater(_max_jump(hard), 0.1)
     self.assertLess(_max_jump(soft), 0.25 * _max_jump(hard))
 
-  @_with_ift
   def test_forward_unchanged(self):
     for attrs, qpos, softnesses in (('frictionloss="1"', 0.0, dict(frictionloss_activeset_softness=0.1)),
                               ('limited="true" range="-0.5 0.5"', 0.501, dict(limit_activeset_softness=0.1))):
@@ -277,7 +262,6 @@ def _refined_model(softness: float, iterations, tolerance=None, xml: str = _BOX_
 _STIFF_BOX_XML = _BOX_XML.replace('cone="pyramidal"/>', 'cone="pyramidal" impratio="100"/>')
 
 
-@_with_ift
 def _smoothed_root_qacc(softness: float, dx: mjx.Data, dof: int, force: float,
                         newton_iters: int = 30) -> float:
   """Independent reference: Newton on the smoothed residual from the hard solution."""
@@ -311,7 +295,6 @@ class RefinementTest(absltest.TestCase):
         _slope(_refined_model(0.0, 4), self.dx, 0, forces),
     )
 
-  @_with_ift
   def test_forward_unchanged(self):
     """Forward values stay the hard solution (straight-through)."""
     for force in (self._THRESHOLD - 0.5, self._THRESHOLD, self._THRESHOLD + 0.5):
@@ -451,7 +434,7 @@ class RefinementTest(absltest.TestCase):
     for bad, err in ((-1, ValueError), (2.0, TypeError), (True, TypeError),
                      (jp.asarray(8), TypeError)):
       with self.assertRaises(err, msg=repr(bad)):
-        _with_ift(mjx.forward)(_refined_model(0.1, 2, ls_iterations=bad), self.dx)
+        mjx.forward(_refined_model(0.1, 2, ls_iterations=bad), self.dx)
 
   def test_fallback_disabled_uses_partial_point(self):
     """refinement_fallback_enable=False skips the tolerance check (not the NaN guard)."""
@@ -484,28 +467,28 @@ class RefinementTest(absltest.TestCase):
     in_between = (off != surrogate) & (np.abs(off - converged) > 1e-4 * scale)
     self.assertTrue(np.any(in_between))
     d = dx.replace(qfrc_applied=dx.qfrc_applied.at[0].set(self._THRESHOLD))
-    hard = _with_ift(jax.jit(mjx.forward))(_refined_model(0.0, 0, xml=_STIFF_BOX_XML), d)
-    off_fwd = _with_ift(jax.jit(mjx.forward))(
+    hard = jax.jit(mjx.forward)(_refined_model(0.0, 0, xml=_STIFF_BOX_XML), d)
+    off_fwd = jax.jit(mjx.forward)(
         _refined_model(0.1, 2, xml=_STIFF_BOX_XML, fallback_enable=False), d)
     np.testing.assert_array_equal(hard.qacc, off_fwd.qacc)
 
   def test_invalid_fallback_enable_raise(self):
     for bad in (1, 0, 'yes', jp.asarray(True)):
       with self.assertRaises(TypeError, msg=repr(bad)):
-        _with_ift(mjx.forward)(_refined_model(0.1, 2, fallback_enable=bad), self.dx)
+        mjx.forward(_refined_model(0.1, 2, fallback_enable=bad), self.dx)
 
   def test_invalid_tol_raise(self):
     for bad, err in ((-1.0, ValueError), (float('nan'), ValueError),
                      (float('inf'), ValueError), (True, TypeError),
                      (jp.asarray(1e-6), TypeError)):
       with self.assertRaises(err, msg=repr(bad)):
-        _with_ift(mjx.forward)(_refined_model(0.1, 2, tolerance=bad), self.dx)
+        mjx.forward(_refined_model(0.1, 2, tolerance=bad), self.dx)
 
   def test_invalid_iters_raise(self):
     for bad, err in ((-1, ValueError), (1.5, TypeError), (True, TypeError),
                      (jp.asarray(2), TypeError)):
       with self.assertRaises(err, msg=repr(bad)):
-        _with_ift(mjx.forward)(_refined_model(0.1, bad), self.dx)
+        mjx.forward(_refined_model(0.1, bad), self.dx)
 
 
 if __name__ == '__main__':

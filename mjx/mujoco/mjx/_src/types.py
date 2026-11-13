@@ -522,6 +522,7 @@ class Option(PyTreeNode):
   refinement_fallback_enable: bool
   pw_solimp: Optional[jax.Array]
   scan_loop: bool
+  grad_backend: str
   _impl: Union[OptionJAX, mjxw_types.OptionWarp]
 
 

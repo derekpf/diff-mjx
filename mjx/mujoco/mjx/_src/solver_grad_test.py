@@ -1,12 +1,10 @@
-"""Gradient checks for the MJX_GRAD_BACKEND solver backends.
+"""Gradient checks for the solver backends (``opt.grad_backend``).
 
 Converged, regime-stable problems only: here the implicit (ift) gradient,
 the unrolled (scan) gradient and central finite differences of the converged
 solve must agree. Runs in float64.
 """
 
-import os
-from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -68,10 +66,6 @@ _ARM = """
 """
 
 
-def _backend(name):
-  return mock.patch.dict(os.environ, {'MJX_GRAD_BACKEND': name})
-
-
 def _scene(xml, cone, settle, qvel0=None, ctrl=None):
   m = mujoco.MjModel.from_xml_string(xml)
   m.opt.cone = cone
@@ -90,7 +84,9 @@ def _scene(xml, cone, settle, qvel0=None, ctrl=None):
   return m, d
 
 
-def _loss(mx, dx, kind):
+def _loss(mx, dx, kind, backend):
+  """Loss through ``mjx.forward`` with ``opt.grad_backend = backend``."""
+  mx = mx.replace(opt=mx.opt.replace(grad_backend=backend))
   rng = np.random.default_rng(0)
   wa = jp.asarray(rng.normal(size=mx.nv))
   wc = jp.asarray(rng.normal(size=mx.nv))
@@ -110,9 +106,8 @@ def _loss(mx, dx, kind):
   return f
 
 
-def _compile(backend, fn, *args):
-  with _backend(backend):
-    return jax.jit(fn).lower(*args).compile()
+def _compile(fn, *args):
+  return jax.jit(fn).lower(*args).compile()
 
 
 def _fd(f, x0, eps):
@@ -153,11 +148,11 @@ class SolverGradTest(parameterized.TestCase):
     else:
       m, d = _scene(_ARM, cone, 100, ctrl=[0.5, -0.2])
     mx, dx = mjx.put_model(m), mjx.put_data(m, d)
-    f = _loss(mx, dx, kind)
+    f = lambda backend: _loss(mx, dx, kind, backend)
     th = jp.zeros(mx.nv)
 
-    g_ift = np.asarray(_compile('ift', jax.grad(f), th)(th))
-    fds = [np.asarray(_compile('while', lambda x, e=e: _fd(f, x, e), th)(th))
+    g_ift = np.asarray(_compile(jax.grad(f('ift')), th)(th))
+    fds = [np.asarray(_compile(lambda x, e=e: _fd(f('while'), x, e), th)(th))
            for e in (1e-4, 1e-5, 1e-6)]
     fd_err = min(_rel(g_ift, fd) for fd in fds)
 
@@ -171,9 +166,9 @@ class SolverGradTest(parameterized.TestCase):
     mx_cold = mx.tree_replace({
         'opt.disableflags': mx.opt.disableflags | DisableBit.WARMSTART
     })
-    f_cold = _loss(mx_cold, dx, kind)
-    g_scan = np.asarray(_compile('scan', jax.grad(f_cold), th)(th))
-    g_ift_cold = np.asarray(_compile('ift', jax.grad(f_cold), th)(th))
+    f_cold = lambda backend: _loss(mx_cold, dx, kind, backend)
+    g_scan = np.asarray(_compile(jax.grad(f_cold('scan')), th)(th))
+    g_ift_cold = np.asarray(_compile(jax.grad(f_cold('ift')), th)(th))
     self.assertLess(_rel(g_ift_cold, g_ift), 1e-8)
     if cone == mujoco.mjtCone.mjCONE_PYRAMIDAL:
       # Elliptic cones: once the line search stops improving, the masked
@@ -186,13 +181,13 @@ class SolverGradTest(parameterized.TestCase):
     """Documents why ift is preferred for quasi-static contact."""
     m, d = _scene(_ARM, mujoco.mjtCone.mjCONE_PYRAMIDAL, 100, ctrl=[0.5, -0.2])
     mx, dx = mjx.put_model(m), mjx.put_data(m, d)
-    f = _loss(mx, dx, 'qvel')
+    f = lambda backend: _loss(mx, dx, 'qvel', backend)
     th = jp.zeros(mx.nv)
-    with _backend('while'):
-      niter = jax.jit(mjx.forward)(mx, dx)._impl.solver_niter
-    g_ift = np.asarray(_compile('ift', jax.grad(f), th)(th))
-    g_scan = np.asarray(_compile('scan', jax.grad(f), th)(th))
-    fd = np.asarray(_compile('while', lambda x: _fd(f, x, 1e-5), th)(th))
+    mx_while = mx.replace(opt=mx.opt.replace(grad_backend='while'))
+    niter = jax.jit(mjx.forward)(mx_while, dx)._impl.solver_niter
+    g_ift = np.asarray(_compile(jax.grad(f('ift')), th)(th))
+    g_scan = np.asarray(_compile(jax.grad(f('scan')), th)(th))
+    fd = np.asarray(_compile(lambda x: _fd(f('while'), x, 1e-5), th)(th))
 
     self.assertEqual(int(niter), 0)  # warmstart is already the solution
     self.assertLess(_rel(g_ift, fd), 1e-6)
@@ -201,11 +196,11 @@ class SolverGradTest(parameterized.TestCase):
   def test_ift_vmap(self):
     m, d = _scene(_BOX, mujoco.mjtCone.mjCONE_PYRAMIDAL, 50)
     mx, dx = mjx.put_model(m), mjx.put_data(m, d)
-    f = _loss(mx, dx, 'qvel')
+    f = _loss(mx, dx, 'qvel', 'ift')
     th = jp.zeros((4, mx.nv)).at[:, 0].set(jp.linspace(0.0, 0.3, 4))
-    g_b = np.asarray(_compile('ift', jax.vmap(jax.grad(f)), th)(th))
+    g_b = np.asarray(_compile(jax.vmap(jax.grad(f)), th)(th))
     for i in range(4):
-      g_i = np.asarray(_compile('ift', jax.grad(f), th[i])(th[i]))
+      g_i = np.asarray(_compile(jax.grad(f), th[i])(th[i]))
       np.testing.assert_allclose(g_b[i], g_i, rtol=1e-10, atol=1e-10)
 
 

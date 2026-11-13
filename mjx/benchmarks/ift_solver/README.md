@@ -1,7 +1,7 @@
 # Implicit vs unrolled differentiation of the MJX constraint solver
 
-Benchmarks and validation for the `MJX_GRAD_BACKEND` solver backends
-(`ift`, the default, plus `unrolled`, `while`, `scan`). The backends are documented in the
+Benchmarks and validation for the solver derivative backends (`opt.grad_backend`:
+`ift`, the default, plus `unrolled`, `while`, `scan`). The backends are documented in the
 repository README ("Constraint-solver derivative backends").
 
 ## Results
@@ -27,17 +27,20 @@ finite-difference checks on the current code.
 
 ## Selecting a backend
 
-```bash
-export MJX_GRAD_BACKEND=ift        # ift (default) | unrolled | while | scan
+```python
+mx = mx.replace(opt=mx.opt.replace(grad_backend='unrolled'))  # ift (default) | unrolled | while | scan
 ```
 
-The variable is read when a function is **traced**; already-compiled
-functions keep their backend. Trace inside the setting (e.g. compile with
-`jax.jit(f).lower(...).compile()` while the variable is set).
+The backend is chosen when a function is **traced**; already-compiled
+functions keep theirs. `bench.py` and `g1_env_bench.py` take the backend as an
+argument and set it on the model. `gradcheck.py` builds functions over one
+model, so it traces each inside `gradcheck.backend(name)` (compile with
+`jax.jit(f).lower(...).compile()` inside the block). The old `MJX_GRAD_BACKEND`
+environment variable is no longer read.
 
 | backend | forward loop | reverse mode | notes |
 |---|---|---|---|
-| unset / `ift` | masked scan (not differentiated) | implicit (`lax.custom_root`) | gradient of the converged fixed point |
+| `ift` (default) | masked scan (not differentiated) | implicit (`lax.custom_root`) | gradient of the converged fixed point |
 | `unrolled` | masked scan (`opt.scan_loop`) or while | unrolled | diff-mjx behaviour before `ift` became the default |
 | `while` | `lax.while_loop` | only `iterations == 1` | upstream MJX |
 | `scan` | fixed `opt.iterations` steps | unrolled | reference fork's `scan` |

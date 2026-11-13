@@ -14,8 +14,6 @@
 # ==============================================================================
 """Tests for constraint functions."""
 
-import os
-from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -40,12 +38,15 @@ jax.config.update('jax_default_matmul_precision', 'highest')
 _TOLERANCE = 5e-3
 
 
+def _with_backend(mx, backend):
+  """``mx`` with ``opt.grad_backend = backend`` (``None``: keep the default)."""
+  if backend is None:
+    return mx
+  return mx.replace(opt=mx.opt.replace(grad_backend=backend))
+
+
 def _solve_with_backend(backend, mx, dx):
-  env = {} if backend is None else {'MJX_GRAD_BACKEND': backend}
-  with mock.patch.dict(os.environ, env, clear=False):
-    if backend is None:
-      os.environ.pop('MJX_GRAD_BACKEND', None)
-    return jax.jit(lambda m, d: mjx.solve(m, d))(mx, dx)
+  return jax.jit(lambda m, d: mjx.solve(m, d))(_with_backend(mx, backend), dx)
 
 
 def _assert_eq(a, b, name, tol=_TOLERANCE):
@@ -195,18 +196,18 @@ class SolverTest(parameterized.TestCase):
     solver.solve(mjx.put_model(m), mjx.put_data(m, mujoco.MjData(m)))
 
   @parameterized.parameters('ift', 'while')
-  def test_backend_matches_unset(self, backend):
+  def test_backend_matches_default(self, backend):
     m, d = self._load_constraints(
         mujoco.mjtSolver.mjSOL_NEWTON, mujoco.mjtCone.mjCONE_PYRAMIDAL
     )
     mx, dx = mjx.put_model(m), mjx.put_data(m, d)
 
-    unset = _solve_with_backend(None, mx, dx)
+    default = _solve_with_backend(None, mx, dx)
     other = _solve_with_backend(backend, mx, dx)
 
-    _assert_attr_eq(unset, other, 'qacc')
-    _assert_attr_eq(unset, other, 'qfrc_constraint')
-    _assert_eq(unset._impl.efc_force, other._impl.efc_force, 'efc_force')
+    _assert_attr_eq(default, other, 'qacc')
+    _assert_attr_eq(default, other, 'qfrc_constraint')
+    _assert_eq(default._impl.efc_force, other._impl.efc_force, 'efc_force')
 
   @parameterized.product(
       backend=('unrolled', 'while', 'scan', 'ift'),
@@ -238,9 +239,57 @@ class SolverTest(parameterized.TestCase):
         mujoco.mjtSolver.mjSOL_NEWTON, mujoco.mjtCone.mjCONE_PYRAMIDAL
     )
 
-    with mock.patch.dict(os.environ, {'MJX_GRAD_BACKEND': 'not-a-backend'}):
-      with self.assertRaisesRegex(ValueError, 'MJX_GRAD_BACKEND'):
-        solver.solve(mjx.put_model(m), mjx.put_data(m, d))
+    mx = _with_backend(mjx.put_model(m), 'not-a-backend')
+    with self.assertRaisesRegex(ValueError, 'opt.grad_backend'):
+      solver.solve(mx, mjx.put_data(m, d))
+
+  def test_grad_backend_option_default(self):
+    m, _ = self._load_constraints(
+        mujoco.mjtSolver.mjSOL_NEWTON, mujoco.mjtCone.mjCONE_PYRAMIDAL
+    )
+    mx = mjx.put_model(m)
+    self.assertEqual(mx.opt.grad_backend, 'ift')
+    self.assertEqual(solver.grad_backend(mx), 'ift')
+
+  def test_grad_backend_validation(self):
+    m, _ = self._load_constraints(
+        mujoco.mjtSolver.mjSOL_NEWTON, mujoco.mjtCone.mjCONE_PYRAMIDAL
+    )
+    mx = mjx.put_model(m)
+    for name in ('unrolled', 'while', 'scan', 'ift', 'IFT'):
+      self.assertEqual(solver.grad_backend(_with_backend(mx, name)), name.lower())
+    for bad, err in (('', ValueError), ('newton', ValueError), (1, TypeError),
+                     (jp.asarray(1), TypeError)):
+      with self.assertRaisesRegex(err, 'opt.grad_backend', msg=repr(bad)):
+        solver.grad_backend(_with_backend(mx, bad))
+    no_backend = mx.replace(opt=mx.opt.replace(grad_backend=None))
+    with self.assertRaisesRegex(TypeError, 'opt.grad_backend'):
+      solver.grad_backend(no_backend)
+
+  def test_grad_backend_option_selects_method(self):
+    """The option changes how solve is differentiated, per model: with one
+    forward iteration, unrolled differentiates the truncated iterate and ift
+    the converged fixed point, so their gradients differ."""
+    m, d = self._load_constraints(
+        mujoco.mjtSolver.mjSOL_NEWTON, mujoco.mjtCone.mjCONE_PYRAMIDAL
+    )
+    m.opt.iterations = 1
+    mx, dx = mjx.put_model(m), mjx.put_data(m, d)
+    weights = jp.linspace(0.1, 1.0, dx.qacc.shape[0])
+
+    def grad(backend):
+      mb = _with_backend(mx, backend)
+
+      def loss(qfrc_smooth):
+        return jp.dot(weights, mjx.solve(mb, dx.replace(qfrc_smooth=qfrc_smooth)).qacc)
+
+      return np.asarray(jax.jit(jax.grad(loss))(dx.qfrc_smooth))
+
+    unrolled, ift = grad('unrolled'), grad('ift')
+    self.assertTrue(np.all(np.isfinite(unrolled)) and np.all(np.isfinite(ift)))
+    self.assertGreater(np.max(np.abs(unrolled - ift)), 1e-3 * np.max(np.abs(ift)))
+    # No process-wide state: selecting ift in between does not leak.
+    np.testing.assert_array_equal(grad('unrolled'), unrolled)
 
   @parameterized.product(
       backend=('unrolled', 'scan', 'ift'),
@@ -255,17 +304,15 @@ class SolverTest(parameterized.TestCase):
   )
   def test_backend_reverse_mode(self, backend, solver_, cone):
     m, d = self._load_constraints(solver_, cone)
-    mx, dx = mjx.put_model(m), mjx.put_data(m, d)
+    mx, dx = _with_backend(mjx.put_model(m), backend), mjx.put_data(m, d)
     weights = jp.linspace(0.1, 1.0, dx.qacc.shape[0])
 
-    with mock.patch.dict(os.environ, {'MJX_GRAD_BACKEND': backend}):
+    def loss(qfrc_smooth):
+      dy = mjx.solve(mx, dx.replace(qfrc_smooth=qfrc_smooth))
+      return jp.dot(weights, dy.qacc)
 
-      def loss(qfrc_smooth):
-        dy = mjx.solve(mx, dx.replace(qfrc_smooth=qfrc_smooth))
-        return jp.dot(weights, dy.qacc)
-
-      grad = jax.jit(jax.grad(loss))(dx.qfrc_smooth)
-      grad.block_until_ready()
+    grad = jax.jit(jax.grad(loss))(dx.qfrc_smooth)
+    grad.block_until_ready()
 
     self.assertTrue(np.all(np.isfinite(grad)))
 

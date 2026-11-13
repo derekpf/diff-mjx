@@ -276,6 +276,8 @@ def _put_option(
   pw_solimp = getattr(o, 'pw_solimp', None)
   fields['pw_solimp'] = None if pw_solimp is None else jp.array(pw_solimp)
   fields['scan_loop'] = bool(getattr(o, 'scan_loop', True))
+  # Gradient backend of the constraint solve (see solver.grad_backend).
+  fields['grad_backend'] = getattr(o, 'grad_backend', 'ift')
 
   option_obj = {
       types.Impl.JAX: types.OptionJAX,
