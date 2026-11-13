@@ -608,17 +608,23 @@ def _softplus(x: jax.Array) -> jax.Array:
   return sj.relu(x, softness=1.0, mode='smooth', gated=False)
 
 
-_LI2_TERMS = 40
+def _li2_terms(dtype) -> int:
+  """Series terms for ``Li2(w)``, ``0 <= w <= 1/2``: the truncation error is
+  below ``w**(K+1) / ((K+1)**2 (1 - w)) <= 2**-K / (K+1)**2``, under the
+  dtype's rounding for ``K = 40`` (float64) and ``K = 20`` (float32 and
+  narrower, ``2e-9`` against ``F(0) = pi**2/12``)."""
+  return 40 if jp.finfo(dtype).bits > 32 else 20
 
 
 def _li2_half(w: jax.Array) -> jax.Array:
-  """Dilogarithm ``Li2(w)`` for ``0 <= w <= 1/2`` by its power series.
-
-  With ``w <= 1/2`` the truncation error of 40 terms is below
-  ``2**-40 / 1600``, under float64 rounding.
-  """
-  k = jp.arange(1, _LI2_TERMS + 1, dtype=w.dtype)
-  return jp.sum(w[..., None] ** k / (k * k), axis=-1)
+  """Dilogarithm ``Li2(w) = sum_k w**k / k**2`` for ``0 <= w <= 1/2``, by
+  Horner's rule (one multiply-add per term, no powers), with
+  ``_li2_terms(w.dtype)`` terms."""
+  k_max = _li2_terms(w.dtype)
+  acc = jp.full_like(w, 1.0 / (k_max * k_max))
+  for k in range(k_max - 1, 0, -1):
+    acc = 1.0 / (k * k) + w * acc
+  return w * acc
 
 
 @jax.custom_jvp
@@ -844,7 +850,7 @@ def _contact_group_force(y, efc_d, ell, slip_softness, liftoff_softness):
   return _contact_group_terms(y, efc_d, ell, slip_softness, liftoff_softness)[0]
 
 
-@_contact_group_force.defjvp
+@functools.partial(_contact_group_force.defjvp, symbolic_zeros=True)
 def _contact_group_force_jvp(slip_softness, liftoff_softness, primals, tangents):
   """``df = -(hess C) dy + f(y; dD)``.
 
@@ -853,7 +859,8 @@ def _contact_group_force_jvp(slip_softness, liftoff_softness, primals, tangents)
   ``(tau'/N) (a 1^T + 1 a^T) + c 1 1^T`` with ``a_e = D_e d2h/dy dtau =
   -D_e G'(u_e)``, ``c = (tau'/N)^2 sum D d2h/dtau2 + tau''/N^2 sum D tau G``;
   a contact with a zero band has the hard mask ``diag(D [y < 0])``.
-  The force is linear in ``D``, so its ``D`` tangent is the force at ``dD``.
+  The force is linear in ``D``, so its ``D`` tangent is the force at ``dD``,
+  formed from the terms already computed; zero tangents are skipped.
   ``ell`` is held constant (``stop_gradient`` upstream).
   """
   y, efc_d, ell = primals
@@ -862,6 +869,18 @@ def _contact_group_force_jvp(slip_softness, liftoff_softness, primals, tangents)
       _contact_group_terms(y, efc_d, ell, slip_softness, liftoff_softness)
   )
   rows = y.shape[1]
+  tau_c = tau[:, None]
+  d_force = jp.zeros_like(force)
+  if not _is_zero(d_efc_d):
+    # Linear in D: the force at dD, from the terms already computed.
+    d_force = jp.where(
+        on[:, None],
+        d_efc_d * tau_c * sp
+        + (-dtau / rows * jp.sum(d_efc_d * tau_c * g, axis=1))[:, None],
+        d_efc_d * jp.where(y < 0, -y, 0.0),
+    )
+  if _is_zero(dy):
+    return force, d_force
   g1 = jp.where(pos, sp_m + u * sg_m, sp - u * sg)             # G'(u)
   h_tt = jp.where(                                             # d2h / dtau2
       pos,  # u * (u * s): u * u overflows for a vanishing band
@@ -880,37 +899,15 @@ def _contact_group_force_jvp(slip_softness, liftoff_softness, primals, tangents)
       + (c * one_dy)[:, None]
   )
   hess_dy = jp.where(on[:, None], hess_dy, efc_d * (y < 0) * dy)
-  d_force = -hess_dy + _contact_group_terms(
-      y, d_efc_d, ell, slip_softness, liftoff_softness
-  )[0]
-  return force, d_force
-
-
-def _softplus_divided_difference(a: jax.Array, b: jax.Array) -> jax.Array:
-  """``(softplus(b) - softplus(a)) / (b - a)``, in ``(0, 1)``, without
-  cancellation: the mean slope of softplus over ``[a, b]``.
-
-  For a midpoint above 0 it uses ``softplus(x) = x + softplus(-x)``, so the
-  difference is taken of the small values; for ``|b - a| < 1e-2`` the
-  midpoint expansion ``sigmoid(m) + sigmoid''(m) (b - a)**2 / 24``.
-  """
-  flip = a + b > 0
-  a, b = jp.where(flip, -a, a), jp.where(flip, -b, b)
-  delta = b - a
-  small = jp.abs(delta) < 1e-2
-  s = jax.nn.sigmoid(0.5 * (a + b))
-  near = s + s * (1.0 - s) * (1.0 - 2.0 * s) * delta * delta / 24.0
-  far = (_softplus(b) - _softplus(a)) / jp.where(small, 1.0, delta)
-  slope = jp.where(small, near, far)
-  return jp.where(flip, 1.0 - slope, slope)
+  return force, -hess_dy + d_force
 
 
 def _kink_terms(u: jax.Array) -> dict[str, jax.Array]:
   """Per-kink terms of ``h(k, tau) = tau**2 F(-k / tau)`` at ``u = -k / tau``,
   with ``F`` evaluated once (at ``-|u|``) and cancellation-free forms:
-  ``sp = softplus(u)``, ``sg = sigmoid(u)``, ``g = G(u) = 2F - u sp`` (so
-  ``dh/dtau = tau G``), ``g1 = G'(u) = sp - u sg`` (``d2h/dy dtau = -G'``) and
-  ``htt = d2h/dtau2 = 2F - 2u sp + u**2 sg``."""
+  ``sp = softplus(u)``, ``sg = sigmoid(u)`` (and both at ``-u``),
+  ``g = G(u) = 2F - u sp`` (so ``dh/dtau = tau G``), ``g1 = G'(u) = sp - u sg``
+  (``d2h/dy dtau = -G'``) and ``htt = d2h/dtau2 = 2F - 2u sp + u**2 sg``."""
   pos = u > 0
   sp, sg = _softplus(u), jax.nn.sigmoid(u)
   sp_m, sg_m = _softplus(-u), jax.nn.sigmoid(-u)
@@ -918,6 +915,8 @@ def _kink_terms(u: jax.Array) -> dict[str, jax.Array]:
   return dict(
       sp=sp,
       sg=sg,
+      sp_m=sp_m,
+      sg_m=sg_m,
       g=jp.where(pos, jp.pi**2 / 3 - 2.0 * f_m - u * sp_m, 2.0 * f_m - u * sp),
       g1=jp.where(pos, sp_m + u * sg_m, sp - u * sg),
       htt=jp.where(  # u * (u * s): u * u overflows for a vanishing band
@@ -930,24 +929,25 @@ def _kink_terms(u: jax.Array) -> dict[str, jax.Array]:
 
 def _divided_difference(ga, gb, a, b, d1_mid, d3_mid):
   """``(g(b) - g(a)) / (b - a)`` from ``ga = g(a)``, ``gb = g(b)``; for
-  ``|b - a| < 1e-2`` the midpoint expansion ``g'(m) + g'''(m) (b - a)**2 / 24``
-  (``d1_mid``, ``d3_mid``), which avoids dividing by a vanishing width."""
+  ``|b - a| < 1e-2`` the midpoint expansion ``g'(m) + g3(m) (b - a)**2 / 24``
+  (``d1_mid``, ``d3_mid``: the first and third derivatives at the midpoint),
+  which avoids dividing by a vanishing width."""
   delta = b - a
   small = jp.abs(delta) < 1e-2
   far = (gb - ga) / jp.where(small, 1.0, delta)
   return jp.where(small, d1_mid + d3_mid * delta * delta / 24.0, far)
 
 
-def _sigmoid_derivs(x):
-  """``sigmoid'``, ``sigmoid''``, ``sigmoid'''`` at ``x``."""
-  s = jax.nn.sigmoid(x)
+def _sigmoid_derivs(s: jax.Array):
+  """First three derivatives of sigmoid where its value is ``s``."""
   s1 = s * (1.0 - s)
   return s1, s1 * (1.0 - 2.0 * s), s1 * (1.0 - 6.0 * s1)
 
 
 def _elliptic_group_terms(y, efc_d, ell, friction, mu, slip_softness, liftoff_softness):
   """Force of one block of elliptic contacts and the terms its tangent rule
-  reuses (see ``_elliptic_group_force``)."""
+  reuses (see ``_elliptic_group_force``). The force is ``D_m`` times a unit
+  force (``unit``), so its ``D`` tangent is a scaling."""
   mu = jp.maximum(mu, mujoco.mjMINVAL)
   mu2 = mu * mu
   n = mu * y[:, 0]
@@ -959,24 +959,36 @@ def _elliptic_group_terms(y, efc_d, ell, friction, mu, slip_softness, liftoff_so
   tau, dtau, d2tau = _contact_band_terms(n, mu * ell, slip_softness, liftoff_softness)
   on = tau > _MIN_BAND
   tau = jp.where(on, tau, 1.0)  # finite u; the off contacts are replaced below
-  dm = efc_d[:, 0] / jp.maximum(mu2 * (1.0 + mu2), mujoco.mjMINVAL)
+  dm_scale = 1.0 / jp.maximum(mu2 * (1.0 + mu2), mujoco.mjMINVAL)
+  dm = efc_d[:, 0] * dm_scale
   u1 = (mu * rho - n) / tau
   u2 = -(n + rho / mu) / tau
   k1, k2 = _kink_terms(u1), _kink_terms(u2)
-  f_n = dm * tau * (k1['sp'] + mu2 * k2['sp']) - dtau * dm * tau * (
-      k1['g'] + mu2 * k2['g']
+  # S = mean slope of softplus over [u1, u2], cancellation-free: the values at
+  # -u when the midpoint is above 0 (softplus(x) = x + softplus(-x)).
+  m = 0.5 * (u1 + u2)
+  flip = m > 0
+  s_mid = jax.nn.sigmoid(-jp.abs(m))  # sigmoid at the (flipped) midpoint, <= 1/2
+  s1, s2, s3 = _sigmoid_derivs(s_mid)
+  a_, b_ = jp.where(flip, -u1, u1), jp.where(flip, -u2, u2)
+  slope = _divided_difference(
+      jp.where(flip, k1['sp_m'], k1['sp']), jp.where(flip, k2['sp_m'], k2['sp']),
+      a_, b_, s_mid, s2,
   )
-  w = dm * (1.0 + mu2) * _softplus_divided_difference(u1, u2)  # Phi_rho / rho
+  slope = jp.where(flip, 1.0 - slope, slope)
+  f_n = tau * (k1['sp'] + mu2 * k2['sp']) - dtau * tau * (k1['g'] + mu2 * k2['g'])
+  w = (1.0 + mu2) * slope  # Phi_rho / (rho D_m)
   # Hard force (MuJoCo's zones) for contacts with a zero band.
   a1 = jp.maximum(rho * mu - n, 0.0)
   a2 = jp.maximum(-n - rho / mu, 0.0)
-  f_n = jp.where(on, f_n, dm * (a1 + mu2 * a2))
-  w = jp.where(on, w, dm * mu * (a1 - a2) / rho_safe)
-  f_t = -w[:, None] * t
-  force = jp.concatenate(((mu * f_n)[:, None], friction * f_t), axis=1)
+  f_n = jp.where(on, f_n, a1 + mu2 * a2)
+  w = jp.where(on, w, mu * (a1 - a2) / rho_safe)
+  unit = jp.concatenate(((mu * f_n)[:, None], friction * (-w[:, None] * t)), axis=1)
+  force = dm[:, None] * unit
   aux = dict(mu=mu, mu2=mu2, n=n, t=t, rho=rho, rho_safe=rho_safe, tau=tau,
-             dtau=dtau, d2tau=d2tau, on=on, dm=dm, u1=u1, u2=u2, k1=k1, k2=k2,
-             w=w, a1=a1, a2=a2)
+             dtau=dtau, d2tau=d2tau, on=on, dm=dm, dm_scale=dm_scale, u1=u1,
+             u2=u2, k1=k1, k2=k2, w=dm * w, a1=a1, a2=a2, m=m, flip=flip,
+             a_=a_, b_=b_, s1=s1, s2=s2, s3=s3, unit=unit)
   return force, aux
 
 
@@ -1062,13 +1074,16 @@ def _elliptic_group_force_jvp(slip_softness, liftoff_softness, primals, tangents
         for c, k in ((1.0, k1), (mu2, k2))
     )
     phi_rr = dm * (mu2 * k1['sg'] + k2['sg'])
-    m = 0.5 * (u1 + u2)
-    s1, s2, s3 = _sigmoid_derivs(m)
-    flip = m > 0  # sigmoid's divided difference is symmetric under u -> -u
-    sa, sb = jax.nn.sigmoid(jp.where(flip, -u1, u1)), jax.nn.sigmoid(jp.where(flip, -u2, u2))
-    dd_sg = _divided_difference(sa, sb, jp.where(flip, -u1, u1), jp.where(flip, -u2, u2), s1, s3)
-    # G'' = -u sigmoid', G'''' = -2 sigmoid'' - u sigmoid''' (at the midpoint)
-    dd_g1 = _divided_difference(k1['g1'], k2['g1'], u1, u2, -m * s1, -2.0 * s2 - m * s3)
+    # Divided differences over [u1, u2]: sigmoid's is symmetric under u -> -u
+    # (so it uses the flipped values, <= 1/2); G' uses the midpoint m.
+    flip, m, s1, s2, s3 = a['flip'], a['m'], a['s1'], a['s2'], a['s3']
+    dd_sg = _divided_difference(
+        jp.where(flip, k1['sg_m'], k1['sg']), jp.where(flip, k2['sg_m'], k2['sg']),
+        a['a_'], a['b_'], s1, s3,
+    )
+    s2_m = jp.where(flip, -s2, s2)  # sigmoid'' is odd; s1, s3 are even
+    # (G')' = -u sigmoid', (G')''' = -2 sigmoid'' - u sigmoid''' (at m)
+    dd_g1 = _divided_difference(k1['g1'], k2['g1'], u1, u2, -m * s1, -2.0 * s2_m - m * s3)
     w_n = -dm * (1.0 + mu2) / tau * (dd_sg - dtau * dd_g1)
     # Hard Hessian (MuJoCo's zones) for contacts with a zero band.
     i1 = (a['a1'] > 0).astype(t.dtype)
@@ -1079,8 +1094,8 @@ def _elliptic_group_force_jvp(slip_softness, liftoff_softness, primals, tangents
     w = a['w']
     dn = mu_ * dy[:, 0]
     dt = friction * dy[:, 1:]
-    t_dt = jp.sum(t * dt, axis=1)
     that_dt = jp.sum(that * dt, axis=1)
+    t_dt = a['rho'] * that_dt
     df_n = -(phi_nn * dn + w_n * t_dt)
     df_t = -(
         (w_n * dn)[:, None] * t
@@ -1088,10 +1103,8 @@ def _elliptic_group_force_jvp(slip_softness, liftoff_softness, primals, tangents
         + ((phi_rr - w) * that_dt)[:, None] * that
     )
     d_force = d_force + jp.concatenate(((mu_ * df_n)[:, None], friction * df_t), axis=1)
-  if not _is_zero(d_efc_d):  # linear in D (through D_0)
-    d_force = d_force + _elliptic_group_terms(
-        y, d_efc_d, ell, friction, mu, slip_softness, liftoff_softness
-    )[0]
+  if not _is_zero(d_efc_d):  # D_m * unit, D_m = D_0 / (mu**2 (1 + mu**2))
+    d_force = d_force + (d_efc_d[:, 0] * a['dm_scale'])[:, None] * a['unit']
   if not (_is_zero(d_friction) and _is_zero(d_mu)):
     zero = lambda x, dx: jp.zeros_like(x) if _is_zero(dx) else dx
     _, d_par = jax.jvp(
@@ -1651,7 +1664,9 @@ def _ift_factor(m: Model, d: Data, qacc: jax.Array, softnesses) -> tuple:
   force is minus the gradient of the convex constraint cost), so Cholesky.
   """
   softness = _softness_kwargs(softnesses)
-  ctx = Context.create(m, d.replace(qacc=qacc), grad=False, **softness)
+  # The context only supplies Jaref (and the elliptic cone's scaled friction):
+  # build it without smoothing, which the force below applies itself.
+  ctx = Context.create(m, d.replace(qacc=qacc), grad=False)
   efc_j = d._impl.efc_J
 
   def force(jaref):

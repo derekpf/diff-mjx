@@ -356,6 +356,27 @@ class PerContactCostTest(absltest.TestCase):
     np.testing.assert_allclose(
         jax.vmap(jax.grad(jax.grad(solver._softplus_integral)))(z), jax.nn.sigmoid(z), atol=1e-12)
 
+  def test_dilogarithm_series(self):
+    """Horner's series matches a long direct sum in float64, and float32 (20
+    terms) matches float64 to float32 rounding."""
+    w = np.linspace(0.0, 0.5, 501)
+    k = np.arange(1, 81)
+    direct = np.sum(w[:, None] ** k / (k * k), axis=1)
+    np.testing.assert_allclose(solver._li2_half(jp.asarray(w)), direct, rtol=1e-15, atol=1e-16)
+    self.assertEqual(solver._li2_terms(jp.float64), 40)
+    self.assertEqual(solver._li2_terms(jp.float32), 20)
+    # Truncation: 20 terms in float32 against the float64 series at the same w.
+    w32 = jp.asarray(w, jp.float32)
+    np.testing.assert_allclose(solver._li2_half(w32), solver._li2_half(w32.astype(jp.float64)),
+                               rtol=3e-7, atol=0)
+    # End to end, F in float32: within float32 rounding of its exp/log terms,
+    # which is a few ulp relative even in the far tail (F ~ 1e-17 at z = -40).
+    z = np.linspace(-40.0, 40.0, 801)
+    f64 = np.asarray(solver._softplus_integral(jp.asarray(z)))
+    f32 = np.asarray(solver._softplus_integral(jp.asarray(z, jp.float32)))
+    self.assertEqual(f32.dtype, np.float32)
+    np.testing.assert_allclose(f32, f64, rtol=5e-6, atol=0)
+
   def test_convexity_conditions(self):
     """h(y, tau) = tau^2 F(-y/tau): jointly convex, nondecreasing in tau."""
     u = jp.linspace(-60.0, 60.0, 120001)
@@ -1423,6 +1444,25 @@ class BackwardImplementationTest(absltest.TestCase):
           f1, t1 = jax.jvp(lambda a, b: solver._contact_group_force(a, b, ell, slip, lift), (y, dd), tangents)
           np.testing.assert_allclose(f1, f0, rtol=1e-12, atol=1e-12 * float(jp.max(jp.abs(f0))))
           np.testing.assert_allclose(t1, t0, rtol=1e-10, atol=1e-10 * float(jp.max(jp.abs(t0))))
+
+  def test_contact_tangent_rule_partial_tangents(self):
+    """Only y or only D perturbed (symbolic-zero paths of the tangent rule)."""
+    rng = np.random.default_rng(3)
+    for slip, lift in ((0.2, 0.05), (0.3, 0.0), (0.0, 0.2)):
+      y = jp.asarray(rng.normal(size=(3, 4)) * 3.0)
+      dd = jp.asarray(rng.uniform(0.5, 50.0, size=(3, 4)))
+      ell = jp.asarray(rng.uniform(0.5, 5.0, size=3))
+      ref = jax.vmap(lambda a, b, e: -jax.grad(_reference_cost)(a, b, e, slip, lift))
+      dy, ddd = jp.asarray(rng.normal(size=(3, 4))), jp.asarray(rng.normal(size=(3, 4)))
+      for y_only in (True, False):
+        if y_only:
+          _, t1 = jax.jvp(lambda a: solver._contact_group_force(a, dd, ell, slip, lift), (y,), (dy,))
+          _, t0 = jax.jvp(lambda a: ref(a, dd, ell), (y,), (dy,))
+        else:
+          _, t1 = jax.jvp(lambda b: solver._contact_group_force(y, b, ell, slip, lift), (dd,), (ddd,))
+          _, t0 = jax.jvp(lambda b: ref(y, b, ell), (dd,), (ddd,))
+        np.testing.assert_allclose(t1, t0, rtol=1e-9, atol=1e-9 * float(jp.max(jp.abs(t0))),
+                                   err_msg=f'{slip} {lift} y_only={y_only}')
 
   def test_contact_second_derivative(self):
     """The tangent rule is itself differentiable (second-order use)."""
