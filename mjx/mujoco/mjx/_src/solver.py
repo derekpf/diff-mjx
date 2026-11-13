@@ -19,7 +19,9 @@ import numbers
 
 import jax
 from jax import numpy as jp
+from jax.custom_derivatives import SymbolicZero
 import mujoco
+import numpy as np
 import softjax as sj
 from mujoco.mjx._src import math
 from mujoco.mjx._src import smooth
@@ -665,8 +667,9 @@ def _contact_edge_groups(m: Model) -> list[tuple[int, int, int]]:
 
   ``make_constraint`` lays contact rows out after the equality, friction-loss
   and limit rows: condim-1 (frictionless) contacts with one row each, then
-  pyramidal condim 3, 4 and 6 contacts with ``2 * (condim - 1)`` edge rows
-  each, every contact's rows consecutive (``make_efc_type``).
+  condim 3, 4 and 6 contacts with ``2 * (condim - 1)`` pyramid edge rows each
+  (pyramidal cone) or ``condim`` rows each, normal first (elliptic cone),
+  every contact's rows consecutive (``make_efc_type``).
   """
   # Imported here: constraint imports collision_driver, which imports more of
   # the package than this module needs at load time.
@@ -681,7 +684,12 @@ def _contact_edge_groups(m: Model) -> list[tuple[int, int, int]]:
   start, groups = int(ne + nf + nl), []
   for condim in (1, 3, 4, 6):
     n = int((dim == condim).sum())
-    rows = 1 if condim == 1 else 2 * (condim - 1)
+    if condim == 1:
+      rows = 1
+    elif m.opt.cone == ConeType.ELLIPTIC:
+      rows = condim
+    else:
+      rows = 2 * (condim - 1)
     if n:
       groups.append((start, n, rows))
     start += n * rows
@@ -776,14 +784,26 @@ def _contact_cost_force(
   if not groups:
     return jp.zeros_like(jaref)
   efc_d = d._impl.efc_D
+  elliptic = m.opt.cone == ConeType.ELLIPTIC
   # Contact blocks are contiguous and end the row layout (_contact_edge_groups).
   parts = [jp.zeros(groups[0][0], jaref.dtype)]
   for start, ncon, rows in groups:
     sl = slice(start, start + ncon * rows)
-    force = _contact_group_force(
-        jaref[sl].reshape(ncon, rows), efc_d[sl].reshape(ncon, rows),
-        scale[sl].reshape(ncon, rows)[:, 0], slip_softness, liftoff_softness,
-    )
+    y = jaref[sl].reshape(ncon, rows)
+    dd = efc_d[sl].reshape(ncon, rows)
+    ell = scale[sl].reshape(ncon, rows)[:, 0]  # the normal row's (edges share it)
+    if elliptic and rows > 1:
+      # Elliptic condim-``rows`` contacts, in make_constraint's order.
+      con = np.nonzero(np.asarray(d._impl.contact.dim) == rows)[0]
+      if con.size != ncon:
+        raise ValueError('elliptic contacts do not match their constraint rows.')
+      friction = d._impl.contact.friction[con]
+      mu = friction[:, 0] / jp.sqrt(m.opt.impratio)
+      force = _elliptic_group_force(
+          y, dd, ell, friction[:, : rows - 1], mu, slip_softness, liftoff_softness
+      )
+    else:
+      force = _contact_group_force(y, dd, ell, slip_softness, liftoff_softness)
     parts.append(force.reshape(-1))
   return jp.concatenate(parts)
 
@@ -866,6 +886,239 @@ def _contact_group_force_jvp(slip_softness, liftoff_softness, primals, tangents)
   return force, d_force
 
 
+def _softplus_divided_difference(a: jax.Array, b: jax.Array) -> jax.Array:
+  """``(softplus(b) - softplus(a)) / (b - a)``, in ``(0, 1)``, without
+  cancellation: the mean slope of softplus over ``[a, b]``.
+
+  For a midpoint above 0 it uses ``softplus(x) = x + softplus(-x)``, so the
+  difference is taken of the small values; for ``|b - a| < 1e-2`` the
+  midpoint expansion ``sigmoid(m) + sigmoid''(m) (b - a)**2 / 24``.
+  """
+  flip = a + b > 0
+  a, b = jp.where(flip, -a, a), jp.where(flip, -b, b)
+  delta = b - a
+  small = jp.abs(delta) < 1e-2
+  s = jax.nn.sigmoid(0.5 * (a + b))
+  near = s + s * (1.0 - s) * (1.0 - 2.0 * s) * delta * delta / 24.0
+  far = (_softplus(b) - _softplus(a)) / jp.where(small, 1.0, delta)
+  slope = jp.where(small, near, far)
+  return jp.where(flip, 1.0 - slope, slope)
+
+
+def _kink_terms(u: jax.Array) -> dict[str, jax.Array]:
+  """Per-kink terms of ``h(k, tau) = tau**2 F(-k / tau)`` at ``u = -k / tau``,
+  with ``F`` evaluated once (at ``-|u|``) and cancellation-free forms:
+  ``sp = softplus(u)``, ``sg = sigmoid(u)``, ``g = G(u) = 2F - u sp`` (so
+  ``dh/dtau = tau G``), ``g1 = G'(u) = sp - u sg`` (``d2h/dy dtau = -G'``) and
+  ``htt = d2h/dtau2 = 2F - 2u sp + u**2 sg``."""
+  pos = u > 0
+  sp, sg = _softplus(u), jax.nn.sigmoid(u)
+  sp_m, sg_m = _softplus(-u), jax.nn.sigmoid(-u)
+  f_m = _softplus_integral(-jp.abs(u))
+  return dict(
+      sp=sp,
+      sg=sg,
+      g=jp.where(pos, jp.pi**2 / 3 - 2.0 * f_m - u * sp_m, 2.0 * f_m - u * sp),
+      g1=jp.where(pos, sp_m + u * sg_m, sp - u * sg),
+      htt=jp.where(  # u * (u * s): u * u overflows for a vanishing band
+          pos,
+          jp.pi**2 / 3 - 2.0 * f_m - 2.0 * u * sp_m - u * (u * sg_m),
+          2.0 * f_m - 2.0 * u * sp + u * (u * sg),
+      ),
+  )
+
+
+def _divided_difference(ga, gb, a, b, d1_mid, d3_mid):
+  """``(g(b) - g(a)) / (b - a)`` from ``ga = g(a)``, ``gb = g(b)``; for
+  ``|b - a| < 1e-2`` the midpoint expansion ``g'(m) + g'''(m) (b - a)**2 / 24``
+  (``d1_mid``, ``d3_mid``), which avoids dividing by a vanishing width."""
+  delta = b - a
+  small = jp.abs(delta) < 1e-2
+  far = (gb - ga) / jp.where(small, 1.0, delta)
+  return jp.where(small, d1_mid + d3_mid * delta * delta / 24.0, far)
+
+
+def _sigmoid_derivs(x):
+  """``sigmoid'``, ``sigmoid''``, ``sigmoid'''`` at ``x``."""
+  s = jax.nn.sigmoid(x)
+  s1 = s * (1.0 - s)
+  return s1, s1 * (1.0 - 2.0 * s), s1 * (1.0 - 6.0 * s1)
+
+
+def _elliptic_group_terms(y, efc_d, ell, friction, mu, slip_softness, liftoff_softness):
+  """Force of one block of elliptic contacts and the terms its tangent rule
+  reuses (see ``_elliptic_group_force``)."""
+  mu = jp.maximum(mu, mujoco.mjMINVAL)
+  mu2 = mu * mu
+  n = mu * y[:, 0]
+  t = friction * y[:, 1:]
+  t2 = jp.sum(t * t, axis=1)
+  moving = t2 > 0
+  rho = jp.where(moving, jp.sqrt(jp.where(moving, t2, 1.0)), 0.0)
+  rho_safe = jp.where(moving, rho, 1.0)
+  tau, dtau, d2tau = _contact_band_terms(n, mu * ell, slip_softness, liftoff_softness)
+  on = tau > _MIN_BAND
+  tau = jp.where(on, tau, 1.0)  # finite u; the off contacts are replaced below
+  dm = efc_d[:, 0] / jp.maximum(mu2 * (1.0 + mu2), mujoco.mjMINVAL)
+  u1 = (mu * rho - n) / tau
+  u2 = -(n + rho / mu) / tau
+  k1, k2 = _kink_terms(u1), _kink_terms(u2)
+  f_n = dm * tau * (k1['sp'] + mu2 * k2['sp']) - dtau * dm * tau * (
+      k1['g'] + mu2 * k2['g']
+  )
+  w = dm * (1.0 + mu2) * _softplus_divided_difference(u1, u2)  # Phi_rho / rho
+  # Hard force (MuJoCo's zones) for contacts with a zero band.
+  a1 = jp.maximum(rho * mu - n, 0.0)
+  a2 = jp.maximum(-n - rho / mu, 0.0)
+  f_n = jp.where(on, f_n, dm * (a1 + mu2 * a2))
+  w = jp.where(on, w, dm * mu * (a1 - a2) / rho_safe)
+  f_t = -w[:, None] * t
+  force = jp.concatenate(((mu * f_n)[:, None], friction * f_t), axis=1)
+  aux = dict(mu=mu, mu2=mu2, n=n, t=t, rho=rho, rho_safe=rho_safe, tau=tau,
+             dtau=dtau, d2tau=d2tau, on=on, dm=dm, u1=u1, u2=u2, k1=k1, k2=k2,
+             w=w, a1=a1, a2=a2)
+  return force, aux
+
+
+@functools.partial(jax.custom_jvp, nondiff_argnums=(5, 6))
+def _elliptic_group_force(y, efc_d, ell, friction, mu, slip_softness, liftoff_softness):
+  """Per-contact smoothed force of one block of elliptic contacts.
+
+  ``y``: ``(ncon, condim)`` rows (normal first), ``friction``: the
+  ``condim - 1`` friction coefficients, ``mu = friction[0] / sqrt(impratio)``.
+  In MuJoCo's scaled coordinates ``n = mu y_0``, ``t_j = f_j y_j``,
+  ``rho = |t|``, the hard cost is ``D_m / 2`` times the squared distance to
+  the cone, which splits into two kinks:
+
+    ``psi = D_m / 2 [relu(-k1)**2 + mu**2 relu(-k2)**2]``,
+    ``k1 = n - mu rho`` (liftoff), ``k2 = n + rho / mu`` (stick/slip),
+
+  ``D_m = D_0 / (mu**2 (1 + mu**2))``. (MuJoCo's friction rows have
+  ``D_j = D_0 f_j**2 / mu**2``, which makes the sticking zone isotropic in
+  ``(n, t)``.) The smoothed cost replaces each ``relu(-k)**2 / 2`` with
+  ``h(k, tau) = tau**2 F(-k / tau)``, both with the contact's band
+  ``tau(n)`` (``_contact_band_terms``, scale ``mu * k*imp*width`` since
+  ``n = mu y_0``):
+
+    ``C = Phi(n, rho) = D_m [h(k1, tau) + mu**2 h(k2, tau)]``.
+
+  The liftoff kink sits at ``n >= 0`` and the stick/slip kink at ``n < 0``,
+  so liftoff is smoothed over ``liftoff_softness`` solimp widths and
+  stick/slip over a fraction ``stickslip_softness`` of utilization
+  ``rho / (mu |n|)``. With ``u1 = -k1 / tau``, ``u2 = -k2 / tau``:
+
+    ``f_n = D_m tau [sp(u1) + mu**2 sp(u2)] - tau' D_m tau [G(u1) + mu**2 G(u2)]``
+    ``f_t = -w t``,  ``w = Phi_rho / rho = D_m (1 + mu**2) S``,
+    ``S = (sp(u2) - sp(u1)) / (u2 - u1)``,
+
+  and the rows' force is ``(mu f_n, f_j (f_t)_j)``.
+
+  Convexity: ``Phi(n, rho)`` is jointly convex (``h`` of linear arguments
+  and a convex band) and, with one band for both kinks, nondecreasing in
+  ``rho >= 0`` (``Phi_rho = D_m mu [h_y(k2) - h_y(k1)] >= 0`` since
+  ``k2 >= k1``), so ``C = Phi(n, |t|)`` is convex; ``Phi_rho = 0`` at
+  ``rho = 0``, so it is differentiable at ``t = 0``. Contacts with a zero
+  band (``liftoff_softness = 0``, unloaded) get the hard force.
+  """
+  return _elliptic_group_terms(
+      y, efc_d, ell, friction, mu, slip_softness, liftoff_softness
+  )[0]
+
+
+def _is_zero(tangent) -> bool:
+  return isinstance(tangent, SymbolicZero)
+
+
+@functools.partial(_elliptic_group_force.defjvp, symbolic_zeros=True)
+def _elliptic_group_force_jvp(slip_softness, liftoff_softness, primals, tangents):
+  """``df = -(hess C) dy + f(y; dD) + (friction and mu tangents)``.
+
+  In ``(n, t)`` the Hessian of ``C = Phi(n, |t|)`` is
+
+    ``H_nn = Phi_nn``,  ``H_nt = w_n t``,  ``H_tt = w I + (Phi_rhorho - w) that that^T``
+
+  with ``that = t / rho`` and, writing ``c = (1, mu**2)`` for the two kinks,
+  ``Phi_nn = D_m sum_i c_i [sg_i - 2 tau' G'_i + tau'**2 htt_i + tau'' tau G_i]``,
+  ``Phi_rhorho = D_m [mu**2 sg_1 + sg_2]`` and ``w_n = -D_m (1 + mu**2) / tau``
+  times the divided difference of ``sigmoid - tau' G'`` over ``[u1, u2]``;
+  none divides by ``rho``, so it holds at ``t = 0``. The force is linear in
+  ``D`` (its ``D`` tangent is the force at ``dD``); tangents in the friction
+  coefficients and ``mu`` use autodiff, and only when present. ``ell`` is
+  held constant (``stop_gradient`` upstream).
+  """
+  y, efc_d, ell, friction, mu = primals
+  dy, d_efc_d, _, d_friction, d_mu = tangents
+  force, a = _elliptic_group_terms(
+      y, efc_d, ell, friction, mu, slip_softness, liftoff_softness
+  )
+  d_force = jp.zeros_like(force)
+  if not _is_zero(dy):
+    mu_, mu2, t, dm, tau, dtau = a['mu'], a['mu2'], a['t'], a['dm'], a['tau'], a['dtau']
+    k1, k2, u1, u2, on = a['k1'], a['k2'], a['u1'], a['u2'], a['on']
+    that = t / a['rho_safe'][:, None]
+    # Smoothed Hessian terms.
+    phi_nn = dm * sum(
+        c * (k['sg'] - 2.0 * dtau * k['g1'] + dtau * dtau * k['htt'] + a['d2tau'] * tau * k['g'])
+        for c, k in ((1.0, k1), (mu2, k2))
+    )
+    phi_rr = dm * (mu2 * k1['sg'] + k2['sg'])
+    m = 0.5 * (u1 + u2)
+    s1, s2, s3 = _sigmoid_derivs(m)
+    flip = m > 0  # sigmoid's divided difference is symmetric under u -> -u
+    sa, sb = jax.nn.sigmoid(jp.where(flip, -u1, u1)), jax.nn.sigmoid(jp.where(flip, -u2, u2))
+    dd_sg = _divided_difference(sa, sb, jp.where(flip, -u1, u1), jp.where(flip, -u2, u2), s1, s3)
+    # G'' = -u sigmoid', G'''' = -2 sigmoid'' - u sigmoid''' (at the midpoint)
+    dd_g1 = _divided_difference(k1['g1'], k2['g1'], u1, u2, -m * s1, -2.0 * s2 - m * s3)
+    w_n = -dm * (1.0 + mu2) / tau * (dd_sg - dtau * dd_g1)
+    # Hard Hessian (MuJoCo's zones) for contacts with a zero band.
+    i1 = (a['a1'] > 0).astype(t.dtype)
+    i2 = (a['a2'] > 0).astype(t.dtype)
+    phi_nn = jp.where(on, phi_nn, dm * (i1 + mu2 * i2))
+    phi_rr = jp.where(on, phi_rr, dm * (mu2 * i1 + i2))
+    w_n = jp.where(on, w_n, dm * mu_ * (i2 - i1) / a['rho_safe'])
+    w = a['w']
+    dn = mu_ * dy[:, 0]
+    dt = friction * dy[:, 1:]
+    t_dt = jp.sum(t * dt, axis=1)
+    that_dt = jp.sum(that * dt, axis=1)
+    df_n = -(phi_nn * dn + w_n * t_dt)
+    df_t = -(
+        (w_n * dn)[:, None] * t
+        + w[:, None] * dt
+        + ((phi_rr - w) * that_dt)[:, None] * that
+    )
+    d_force = d_force + jp.concatenate(((mu_ * df_n)[:, None], friction * df_t), axis=1)
+  if not _is_zero(d_efc_d):  # linear in D (through D_0)
+    d_force = d_force + _elliptic_group_terms(
+        y, d_efc_d, ell, friction, mu, slip_softness, liftoff_softness
+    )[0]
+  if not (_is_zero(d_friction) and _is_zero(d_mu)):
+    zero = lambda x, dx: jp.zeros_like(x) if _is_zero(dx) else dx
+    _, d_par = jax.jvp(
+        lambda f_, m_: _elliptic_group_terms(
+            y, efc_d, ell, f_, m_, slip_softness, liftoff_softness
+        )[0],
+        (friction, mu),
+        (zero(friction, d_friction), zero(mu, d_mu)),
+    )
+    d_force = d_force + d_par
+  return force, d_force
+
+
+def _nominal_contact_rows(m: Model, d: Data) -> jax.Array:
+  """Rows of in-contact (``efc_pos < efc_margin``) contacts, decided per
+  contact by its first row and broadcast to all of its rows."""
+  owner = np.arange(d._impl.efc_type.shape[0])
+  for start, ncon, rows in _contact_edge_groups(m):
+    owner[start : start + ncon * rows] = start + rows * (
+        np.arange(ncon * rows) // rows
+    )
+  row = (d._impl.efc_type >= ConstraintType.CONTACT_FRICTIONLESS) & (
+      d._impl.efc_pos < d._impl.efc_margin
+  )
+  return row[owner]
+
+
 def _update_constraint(
     m: Model,
     d: Data,
@@ -886,9 +1139,11 @@ def _update_constraint(
     stickslip_softness: if this or ``liftoff_softness`` is > 0, the force of
       nominal contacts (in contact, ``efc_pos < efc_margin``) is minus the
       gradient of a smoothed convex per-contact cost (``_contact_cost_force``)
-      instead of ``D * max(0, -Jaref)``: stick/slip is smoothed over a fraction
-      ``stickslip_softness`` of friction utilization at any load. Used only by the IFT residual (``_root``), so the forward solve is
-      unchanged; pyramidal cone only. Built on the non-gated softplus: the
+      instead of the hard force: stick/slip is smoothed over a fraction
+      ``stickslip_softness`` of friction utilization at any load (pyramid
+      edges: ``_contact_cost_force``; elliptic cone: ``_elliptic_group_force``).
+      Used only by the IFT residual (``_root``), so the forward solve is
+      unchanged. Built on the non-gated softplus: the
       gated ``x * sigmoid(x)`` has negative slopes, which can make the IFT
       residual Jacobian indefinite.
     liftoff_softness: liftoff band of that cost, in solimp widths (0 keeps
@@ -935,23 +1190,7 @@ def _update_constraint(
     efc_force = d._impl.efc_D * -ctx.Jaref * active + floss_force
     cost = 0.5 * jp.sum(d._impl.efc_D * ctx.Jaref * ctx.Jaref * active)
     dm, u, h = 0.0, 0.0, 0.0
-    if stickslip_softness > 0 or liftoff_softness > 0:
-      # Smooth the Jaref mask (liftoff, stick/slip) of nominal contact rows only:
-      # pw_solimp rows (efc_pos >= efc_margin) and padding rows keep the hard mask.
-      nominal = (d._impl.efc_type >= ConstraintType.CONTACT_FRICTIONLESS) & (
-          d._impl.efc_pos < d._impl.efc_margin
-      )
-      # A contact's rows share efc_pos, so nominal selects whole contacts and
-      # the per-contact force stays a gradient.
-      smooth_force = _contact_cost_force(
-          m, d, ctx.Jaref, scale, stickslip_softness, liftoff_softness
-      )
-      efc_force = jp.where(nominal, smooth_force, efc_force)
   elif m.opt.cone == ConeType.ELLIPTIC:
-    if stickslip_softness > 0 or liftoff_softness > 0:
-      raise NotImplementedError(
-          'stickslip_softness and liftoff_softness require the pyramidal cone.'
-      )
     friction = d._impl.contact.friction[d._impl.contact.dim > 1]
     efc_address = d._impl.contact.efc_address[d._impl.contact.dim > 1]
     dim = d._impl.contact.dim[d._impl.contact.dim > 1]
@@ -1012,6 +1251,17 @@ def _update_constraint(
       h = jax.vmap(jp.multiply)(h, middle_zone)
   else:
     raise NotImplementedError(f'unsupported cone type: {m.opt.cone}')
+
+  if stickslip_softness > 0 or liftoff_softness > 0:
+    # Smooth nominal contacts only: pw_solimp contacts (efc_pos >= efc_margin)
+    # and padding rows keep the hard force. Whole contacts are selected by
+    # their first (normal) row, so the per-contact force stays a gradient
+    # (elliptic friction rows have efc_pos 0).
+    nominal = _nominal_contact_rows(m, d)
+    smooth_force = _contact_cost_force(
+        m, d, ctx.Jaref, scale, stickslip_softness, liftoff_softness
+    )
+    efc_force = jp.where(nominal, smooth_force, efc_force)
 
   if limit_softness > 0:
     # Engaged limit rows only; disengaged rows keep their zero force.
@@ -1552,9 +1802,5 @@ def solve(m: Model, d: Data) -> Data:
         f'{", ".join(enabled)} > 0 requires the ift gradient backend '
         f'(opt.grad_backend; got {backend!r}); active-set '
         'smoothing only acts in the IFT backward pass.'
-    )
-  if (softnesses[0] > 0 or softnesses[1] > 0) and m.opt.cone != ConeType.PYRAMIDAL:
-    raise NotImplementedError(
-        'stickslip_softness and liftoff_softness require the pyramidal cone.'
     )
   return _BACKENDS[backend](m, d)

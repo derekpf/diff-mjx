@@ -165,13 +165,13 @@ Benchmarks, validation scripts, raw results, and reproduction commands are in [`
 
 ## Constraint cost smoothing (IFT backward)
 
-**What it smooths.** At the solution, each inequality row's force is a ReLU of its residual `Jaref = J qacc - aref`: `f_i = D_i * max(0, -Jaref_i)`. The `ift` backward differentiates the stationarity residual at the converged `qacc`, so each row adds `m_i * D_i * J_i^T J_i` to the residual Jacobian, where `m_i = [Jaref_i < 0]` is the row's active-set mask. The force is continuous where a row switches on or off, but the gradient jumps by that row's rank-1 term. These switches are liftoff, stick/slip (pyramidal edges switching), limit release, and friction-loss stick/slip.
+**What it smooths.** At the solution, each inequality row's force is a ReLU of its residual `Jaref = J qacc - aref`: `f_i = D_i * max(0, -Jaref_i)`. The `ift` backward differentiates the stationarity residual at the converged `qacc`, so each row adds `m_i * D_i * J_i^T J_i` to the residual Jacobian, where `m_i = [Jaref_i < 0]` is the row's active-set mask. The force is continuous where a row switches on or off, but the gradient jumps by that row's rank-1 term. These switches are liftoff, stick/slip (pyramidal edges switching, or an elliptic contact changing zone), limit release, and friction-loss stick/slip.
 
 **Where it acts.** Only in the residual that the `ift` backward differentiates (`solver._root`) and in refinement's Newton iterations on that residual. The forward solve, its line search, and the reported outputs (`qacc`, `efc_force`, `qfrc_constraint`) keep the hard mask, so forward values are unchanged. Without refinement the gradient is evaluated at the hard solution, which is not a root of the smoothed residual, so it is a surrogate gradient, not the derivative of any model (see [Constraint gradient refinement](#constraint-gradient-refinement)).
 
 | option | rows | switch | unit |
 |---|---|---|---|
-| `stickslip_softness` | nominal contacts: frictionless and pyramidal contacts in contact (`efc_pos < efc_margin`) | stick/slip | fraction of the contact's friction utilization |
+| `stickslip_softness` | nominal contacts: frictionless, pyramidal and elliptic contacts in contact (`efc_pos < efc_margin`) | stick/slip | fraction of the contact's friction utilization |
 | `liftoff_softness` | the same contacts | liftoff | solimp widths |
 | `limit_softness` | engaged joint and tendon limit rows (`efc_pos < efc_margin`) | limit release | solimp widths |
 | `frictionloss_softness` | DOF and tendon friction-loss rows | friction-loss stick/slip | stick half-windows `r * frictionloss` |
@@ -247,13 +247,35 @@ Either knob can be 0 while the other is on. With $s_{\mathrm{lift}} = 0$ the ban
 
 **Convexity.** $h$ is jointly convex for $\tau > 0$ (its Hessian determinant is $2FF'' - F'^2 > 0$) and nondecreasing in $\tau$ ($G > 0$), and $\tau(n)$ is non-negative and convex, so $C$ is convex (full proof in the `_contact_cost_force` docstring). The residual Jacobian $M + J^\top \nabla^2 C\, J$ is therefore symmetric positive definite, and the IFT and refinement factor it by Cholesky. On Go1 and G1 rollout states its smallest eigenvalue is at least 0.94 times that of $M$ (`mjx/benchmarks/ift_solver/cost_smoothing_robots.py`).
 
-**In the solver.** Only the backward pass changes: the residual that the IFT differentiates (`_root`), and refinement's Newton iterations on it, use the smoothed forces; the forward solve and its outputs stay hard. The contact force has an analytic tangent rule (`jax.custom_jvp`), and $F$ is computed in closed form.
+**Elliptic cones.** MuJoCo's elliptic contact has no edges: its rows are the normal and the friction components, in scaled coordinates $n = \mu y_0$ and $t_j = f_j y_j$ ($f_j$ the friction coefficients, $\mu = f_1/\sqrt{\text{impratio}}$). Its cost is $\tfrac{D_m}{2}$ times the squared distance to the cone $n \ge \mu \lVert t \rVert$, with three zones: no force (liftoff), force on the cone (sliding), force inside it (sticking). That cost splits into two kinks:
+
+$$
+\psi(n, t) = \frac{D_m}{2} \Big[ \max(0, -k_1)^2 + \mu^2 \max(0, -k_2)^2 \Big],
+\qquad k_1 = n - \mu \lVert t \rVert \;\text{(liftoff)}, \quad k_2 = n + \lVert t \rVert / \mu \;\text{(stick/slip)},
+$$
+
+with $D_m = D_0 / (\mu^2(1+\mu^2))$ and $D_0$ the normal row's `efc_D`. (MuJoCo gives the friction rows $D_j = D_0 f_j^2/\mu^2$, which makes the sticking zone isotropic; the two kinks then reproduce its three zones exactly.) Each kink gets the same smoothed quadratic, with the contact's band $\tau(n)$ evaluated once for both:
+
+$$
+C(n, t) = D_m \Big[ h\big(k_1, \tau(n)\big) + \mu^2\, h\big(k_2, \tau(n)\big) \Big],
+$$
+
+with $\tau(n)$ as above and $\ell_0 = \mu\, s_{\mathrm{lift}}\, k\,\mathrm{imp}\,w / (1+\ln 2)$, since $n = \mu y_0$. The liftoff kink lies at $n \ge 0$ and the stick/slip kink at $n < 0$, so liftoff is smoothed over $s_{\mathrm{lift}}$ solimp widths ($k_1/\tau = y_0 / (s_{\mathrm{lift}}\, k\,\mathrm{imp}\,w)$ without sliding), and stick/slip over a fraction $s_{\mathrm{slip}}$ of utilization $U = \lVert t\rVert / (\mu \lvert n \rvert)$ ($k_2/\tau \approx -(1-U)/s_{\mathrm{slip}}$ under load), as for pyramidal contacts. With $u_i = -k_i/\tau$ the force is
+
+$$
+f_n = D_m\, \tau \big[ \mathrm{softplus}(u_1) + \mu^2\, \mathrm{softplus}(u_2) \big] - \tau'(n)\, D_m\, \tau \big[ G(u_1) + \mu^2 G(u_2) \big],
+\qquad
+f_t = -D_m (1 + \mu^2)\, \frac{\mathrm{softplus}(u_2) - \mathrm{softplus}(u_1)}{u_2 - u_1}\, t,
+$$
+
+and on the rows $(\mu f_n,\ f_j (f_t)_j)$. $C$ is convex: $\varphi(n, \rho) = D_m[h(n - \mu\rho, \tau(n)) + \mu^2 h(n + \rho/\mu, \tau(n))]$ is jointly convex in $(n, \rho)$, and because both kinks share one band it is nondecreasing in $\rho \ge 0$ ($\partial_\rho \varphi = D_m \mu [h_y(k_2) - h_y(k_1)] \ge 0$ with $k_2 \ge k_1$), so $C = \varphi(n, \lVert t\rVert)$ is convex. $\partial_\rho \varphi = 0$ at $\rho = 0$, so $C$ is also differentiable at zero tangential acceleration, the common sticking state. Both knobs work as for pyramidal contacts, including either at 0.
+
+**In the solver.** Only the backward pass changes: the residual that the IFT differentiates (`_root`), and refinement's Newton iterations on it, use the smoothed forces; the forward solve and its outputs stay hard. Both contact forces have an analytic tangent rule (`jax.custom_jvp`), with $F$ computed in closed form once per edge or kink. For elliptic contacts the Hessian in $(n, t)$ is $H_{nn} = \varphi_{nn}$, $H_{nt} = w_n\, t$, $H_{tt} = w\, I + (\varphi_{\rho\rho} - w)\, \hat t \hat t^\top$ with $w = \partial_\rho\varphi / \rho$; $w$ and $w_n$ are divided differences over $[u_1, u_2]$, so nothing divides by $\lVert t\rVert$. Tangents in the friction coefficients use autodiff, only when present. In-contact contacts are selected by their normal row, since elliptic friction rows have `efc_pos` 0.
 
 **Cost.** BPTT through 16 control steps x 32 envs (float32, RTX 5080, stick/slip 0.2, liftoff 0.05, limit and friction loss 0.2, median of 15; `mjx/benchmarks/ift_solver/cost_smoothing_robots.py`): Go1 118.6 ms hard, 121.8 ms smoothed, 159.7 ms smoothed with refinement (`k = 4`, 4 line-search trials); G1 523.6, 527.9 and 643.3 ms.
 
 **Not supported.**
 
-- **Elliptic cones.** Pyramidal contacts are linear rows, which the cost covers. Elliptic cones switch zones (stick, slip, separate) through a coupled per-contact projection onto a second-order cone, which needs a different formulation, with care where the tangential magnitude is zero. Setting `stickslip_softness` or `liftoff_softness` above 0 with `cone="elliptic"` raises `NotImplementedError`. Every registered diff-playground environment uses the pyramidal cone.
 - **Limit touchdown.** Limit engagement is not smoothed. A row only exists once a joint or tendon reaches its limit margin, and it switches on at full impedance with `aref = -b * v`, so an approaching limit still gets a force jump. `limit_softness` covers only the release of an engaged limit. pw_solimp anticipates contact touchdown only and does not apply to limits.
 - **Contact touchdown is left to pw_solimp.** pw_solimp rows (`efc_pos >= efc_margin`) and zeroed padding rows keep the hard mask, so the two mechanisms do not overlap. Under `contact_st_enable`, gradients come from the pw_solimp branch. Smoothing applies to that branch's nominal rows, whose definition is identical to the nominal branch's.
 - **Other backends.** Only `ift` reads these options. Setting any of them above 0 with the `unrolled`, `scan`, or `while` backend raises an error instead of being ignored.
@@ -283,16 +305,17 @@ Either knob can be 0 while the other is on. With $s_{\mathrm{lift}} = 0$ the ban
 - **Dojo** (Howell et al., [arXiv:2203.00806](https://arxiv.org/abs/2203.00806)). It computes smooth gradients by applying the implicit function theorem to a relaxed interior-point solution (central-path parameter > 0) of a hard-contact solver.
 - **Analytic smoothing** (Pang et al., [arXiv:2206.10787](https://arxiv.org/abs/2206.10787)). It smooths a convex quasi-dynamic contact model with a log-barrier relaxation, which gives force-at-a-distance. This changes the model itself, not only the gradient.
 - **Contacts From Distance** (Paulus et al., ICLR 2026, [arXiv:2506.14186](https://arxiv.org/abs/2506.14186)). A backward-only, straight-through mechanism in MJX that gives contact gradients before touch. It is the counterpart for touchdown that pw_solimp implements here.
-- **Implicit contact differentiation in MJX** (Layeghi et al., [arXiv:2607.24959](https://arxiv.org/abs/2607.24959)). The source of the `ift` backend. Its derivative is local to a fixed contact set and friction mode, and its authors note it need not stay valid across contact or friction-mode changes. This method addresses that gap for pyramidal contacts, limits and friction loss.
+- **Implicit contact differentiation in MJX** (Layeghi et al., [arXiv:2607.24959](https://arxiv.org/abs/2607.24959)). The source of the `ift` backend. Its derivative is local to a fixed contact set and friction mode, and its authors note it need not stay valid across contact or friction-mode changes. This method addresses that gap for contacts (pyramidal and elliptic), limits and friction loss.
 - **Simple** (Le Lidec et al., 2024, [paper](https://simple-robotics.github.io/publications/simple-gradients/static/paper/simple2024gradients.pdf)). It observes that active-set implicit gradients do not capture contact-mode boundaries, and suggests combining them with smoothing.
 
 **Tests.** `mjx/mujoco/mjx/_src/solver_softness_test.py`:
 
-- `ContactSoftnessTest`, `LimitAndFrictionlossSoftnessTest`: softness 0 is bit-identical to the default, forward values are unchanged, stick/slip, liftoff, limit release, and friction-loss transitions are smoothed, the gradient converges to the hard one away from a switch, pw_solimp rows are untouched, one row type's softness leaves the others alone, and the elliptic, backend, and invalid-value guards raise.
+- `ContactSoftnessTest` (and `EllipticContactSoftnessTest`, the same on the elliptic cone), `LimitAndFrictionlossSoftnessTest`: softness 0 is bit-identical to the default, forward values are unchanged, stick/slip, liftoff, limit release, and friction-loss transitions are smoothed, the gradient converges to the hard one away from a switch, pw_solimp rows are untouched, one row type's softness leaves the others alone, and the backend and invalid-value guards raise.
 - `PerContactCostTest`: the softplus integral and the convexity proof's identities; the band; the force is minus the gradient of an independently written cost with a positive semidefinite Hessian; the hard limit; stick/slip in utilization units at any load; liftoff in solimp widths; each contact knob at 0 (exactly hard liftoff, or a constant band); `mean_e Jaref_e = Jaref_n`; float32; the IFT gradient against the finite-difference derivative of the smoothed root (condim 1, 3, 4 and 6); the static row blocks.
+- `EllipticContactCostTest`: the two-kink form reproduces MJX's hard elliptic force (condim 3, 4, 6; impratio); the force is minus the gradient of an independently written cost with a positive semidefinite Hessian, for each knob at 0 too; differentiability at zero tangential acceleration (float64 and float32); liftoff in solimp widths and stick/slip in utilization, coinciding across mass, gravity, friction, impratio, solref, solimp and condim (scales from MuJoCo C's `efc_KBIP`); exactly hard liftoff at `liftoff_softness = 0`; the analytic tangent rule (tangents in the rows, `D`, the friction coefficients and $\mu$) and its second derivative against autodiff of the reference cost; float32 against float64; the IFT gradient against the finite-difference derivative of the smoothed root (condim 3, 4, 6); row layout and in-contact selection.
 - `NormalizedCoordinateTest`: friction loss, limits, liftoff and stick/slip give the same curves in their own coordinates across parameter sets.
 - `SoftnessScaleTest`: a contact's scale is MuJoCo's `K * I * width`, shared by all of its pyramid edges, and a friction-loss row's scale is its stick half-window.
-- `BackwardImplementationTest`: the analytic contact tangent rule and its second derivative against autodiff; the IFT against `inv(jacfwd(_root))` in forward and reverse mode (pyramidal and elliptic, condim 1-6, equality, tendon, limit and friction-loss rows; hard and smoothed); refinement against a Newton-converged smoothed root.
+- `BackwardImplementationTest`: the analytic contact tangent rule and its second derivative against autodiff; the IFT against `inv(jacfwd(_root))` in forward and reverse mode (pyramidal and elliptic, condim 1-6, equality, tendon, limit and friction-loss rows; hard and smoothed, including elliptic contact smoothing); refinement against a Newton-converged smoothed root.
 - `RefinementTest`:
   - bit-identical to hard when every softness is 0, and forward values unchanged;
   - converged refinement equals the finite-difference derivative of an independently computed smoothed root, and differs from the surrogate near a switch;

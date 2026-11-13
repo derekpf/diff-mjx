@@ -61,8 +61,11 @@ def _box_contact_scale() -> float:
   return float(dx._impl.efc_softness_scale[0])
 
 
-def _model(softness: float, pw_solimp=None) -> mjx.Model:
-  m = mujoco.MjModel.from_xml_string(_BOX_XML)
+_ELLIPTIC_BOX_XML = _BOX_XML.replace('cone="pyramidal"', 'cone="elliptic"')
+
+
+def _model(softness: float, pw_solimp=None, xml: str = _BOX_XML) -> mjx.Model:
+  m = mujoco.MjModel.from_xml_string(xml)
   mx = mjx.put_model(m)
   opt = mx.opt.replace(stickslip_softness=softness, liftoff_softness=softness)
   if pw_solimp is not None:
@@ -92,16 +95,26 @@ def _is_surrogate(slopes: np.ndarray, surrogate: np.ndarray, scale: float) -> np
 
 
 class ContactSoftnessTest(absltest.TestCase):
+  """Contact smoothing end to end on the resting box (pyramidal cone)."""
+
+  _XML = _BOX_XML
+  # Size of the hard slope's jump at the stick -> slip switch (the sweep's
+  # precondition). The elliptic cone keeps part of the tangential stiffness
+  # when sliding (mu**2 / (1 + mu**2) of it), so its jump is smaller.
+  _MIN_STICK_SLIP_JUMP = 0.1
+
+  def _model(self, softness, pw_solimp=None):
+    return _model(softness, pw_solimp, xml=self._XML)
 
   def setUp(self):
     super().setUp()
-    m = mujoco.MjModel.from_xml_string(_BOX_XML)
+    m = mujoco.MjModel.from_xml_string(self._XML)
     self.d = _resting_data(m)
     self.dx = mjx.put_data(m, self.d)
   def test_softness_zero_matches_default(self):
     """softness=0 (explicit) gives bit-identical forward values and gradients."""
-    m = mujoco.MjModel.from_xml_string(_BOX_XML)
-    mx_default, mx_zero = mjx.put_model(m), _model(0.0)
+    m = mujoco.MjModel.from_xml_string(self._XML)
+    mx_default, mx_zero = mjx.put_model(m), self._model(0.0)
 
     def loss(mx, qvel):
       return jp.sum(mjx.forward(mx, self.dx.replace(qvel=qvel)).qacc ** 2)
@@ -114,22 +127,22 @@ class ContactSoftnessTest(absltest.TestCase):
   def test_forward_unchanged(self):
     """softness>0 leaves forward qacc and efc_force unchanged."""
     d = self.dx.replace(qfrc_applied=self.dx.qfrc_applied.at[0].set(3.0))
-    out0 = jax.jit(mjx.forward)(_model(0.0), d)
-    out1 = jax.jit(mjx.forward)(_model(1.0), d)
+    out0 = jax.jit(mjx.forward)(self._model(0.0), d)
+    out1 = jax.jit(mjx.forward)(self._model(1.0), d)
     np.testing.assert_array_equal(out0.qacc, out1.qacc)
     np.testing.assert_array_equal(out0._impl.efc_force, out1._impl.efc_force)
 
   def _sweep_test(self, dof, center, half_width, softness):
     forces = np.linspace(center - half_width, center + half_width, 401)
-    hard = _slope(_model(0.0), self.dx, dof, forces)
-    soft = _slope(_model(softness), self.dx, dof, forces)
+    hard = _slope(self._model(0.0), self.dx, dof, forces)
+    soft = _slope(self._model(softness), self.dx, dof, forces)
     self.assertTrue(np.isfinite(hard).all() and np.isfinite(soft).all())
     return forces, hard, soft
 
   def test_stick_slip_is_smoothed(self):
     """Tangential force across the friction threshold: hard slope jumps, smoothed slope does not."""
     forces, hard, soft = self._sweep_test(0, _MU * _MASS * _G, 4.0, softness=0.1)
-    self.assertGreater(_max_jump(hard), 0.1)  # the stick -> slip switch
+    self.assertGreater(_max_jump(hard), self._MIN_STICK_SLIP_JUMP)  # the stick -> slip switch
     self.assertLess(_max_jump(soft), 0.25 * _max_jump(hard))
 
   def test_liftoff_is_smoothed(self):
@@ -141,14 +154,14 @@ class ContactSoftnessTest(absltest.TestCase):
   def test_converges_to_nominal_away_from_switch(self):
     """Far from the friction threshold, the smoothed slope approaches the hard one as softness -> 0."""
     forces = np.array([0.5, 1.0, 9.0, 10.0])  # deep stick, deep slip (threshold ~4.9)
-    hard = _slope(_model(0.0), self.dx, 0, forces)
-    errs = [np.max(np.abs(_slope(_model(softness), self.dx, 0, forces) - hard)) for softness in (1.0, 0.1, 0.01)]
+    hard = _slope(self._model(0.0), self.dx, 0, forces)
+    errs = [np.max(np.abs(_slope(self._model(softness), self.dx, 0, forces) - hard)) for softness in (1.0, 0.1, 0.01)]
     self.assertLess(errs[2], errs[0])
-    np.testing.assert_allclose(_slope(_model(1e-3), self.dx, 0, forces), hard, atol=1e-3, rtol=1e-3)
+    np.testing.assert_allclose(_slope(self._model(1e-3), self.dx, 0, forces), hard, atol=1e-3, rtol=1e-3)
   def test_pw_solimp_rows_untouched(self):
     """A separated contact within pw_solimp width is only a pw_solimp row; softness must not change it."""
     pw = [0.0, 0.4, 1.0, 1.0, 10.0]
-    m = mujoco.MjModel.from_xml_string(_BOX_XML)
+    m = mujoco.MjModel.from_xml_string(self._XML)
     d = mujoco.MjData(m)
     d.qpos[2] = 0.1 + 0.05  # 5 cm above the plane: separated, within width
     mujoco.mj_forward(m, d)
@@ -158,31 +171,29 @@ class ContactSoftnessTest(absltest.TestCase):
     def loss(mx, qpos):
       return jp.sum(mjx.forward(mx, dx.replace(qpos=qpos)).qacc ** 2)
 
-    g0 = jax.grad(lambda q: loss(_model(0.0, pw), q))(dx.qpos)
-    g1 = jax.grad(lambda q: loss(_model(1.0, pw), q))(dx.qpos)
+    g0 = jax.grad(lambda q: loss(self._model(0.0, pw), q))(dx.qpos)
+    g1 = jax.grad(lambda q: loss(self._model(1.0, pw), q))(dx.qpos)
     self.assertTrue(np.isfinite(g1).all())
     np.testing.assert_array_equal(g0, g1)
-
-  def test_elliptic_raises(self):
-    m = mujoco.MjModel.from_xml_string(_BOX_XML.replace('cone="pyramidal"', 'cone="elliptic"'))
-    mx = mjx.put_model(m)
-    dx = mjx.put_data(m, _resting_data(m))
-    for knob in ('stickslip_softness', 'liftoff_softness'):
-      mk = mx.replace(opt=mx.opt.replace(**{knob: 1.0}))
-      with self.assertRaises(NotImplementedError):
-        jax.grad(lambda v: jp.sum(mjx.forward(mk, dx.replace(qvel=v)).qacc))(dx.qvel)
 
   def test_non_ift_backend_raises(self):
     unrolled = lambda mx: mx.replace(opt=mx.opt.replace(grad_backend='unrolled'))
     with self.assertRaisesRegex(ValueError, 'ift gradient backend'):
-      mjx.forward(unrolled(_model(0.1)), self.dx)
-    mjx.forward(unrolled(_model(0.0)), self.dx)  # softness=0 is fine on any backend
+      mjx.forward(unrolled(self._model(0.1)), self.dx)
+    mjx.forward(unrolled(self._model(0.0)), self.dx)  # softness=0 is fine on any backend
 
   def test_invalid_softness_raises(self):
     with self.assertRaisesRegex(ValueError, 'finite and >= 0'):
-      mjx.forward(_model(-0.1), self.dx)
+      mjx.forward(self._model(-0.1), self.dx)
     with self.assertRaisesRegex(TypeError, 'Python float'):
-      mjx.forward(_model(jp.asarray(0.1)), self.dx)
+      mjx.forward(self._model(jp.asarray(0.1)), self.dx)
+
+
+class EllipticContactSoftnessTest(ContactSoftnessTest):
+  """The same end-to-end checks on the elliptic cone."""
+
+  _XML = _ELLIPTIC_BOX_XML
+  _MIN_STICK_SLIP_JUMP = 0.05
 
 
 _HINGE_XML = """
@@ -659,6 +670,307 @@ class PerContactCostTest(absltest.TestCase):
     self.assertEqual(groups[-1][0] + groups[-1][1] * groups[-1][2], efc_type.shape[0])
 
 
+_ELLIPTIC_XML = """
+<mujoco>
+  <option timestep="0.002" iterations="100" tolerance="1e-12" cone="elliptic" impratio="{ir}"
+          gravity="0 0 -{g}"/>
+  <worldbody>
+    <geom type="plane" size="5 5 .1" friction="{mu} .005 .0001" solref="{tc} 1" solimp="0.9 0.95 {w}"/>
+    <body pos="0 0 0.1"><freejoint/>
+      <geom type="box" size=".1 .1 .1" mass="{m}" friction="{mu} .005 .0001" condim="{c}"
+            solref="{tc} 1" solimp="0.9 0.95 {w}"/>
+    </body>
+  </worldbody>
+</mujoco>"""
+_ELLIPTIC_DEFAULT = dict(ir=1.0, g=9.81, mu=0.5, tc=0.02, w=0.001, m=1.0, c=3)
+# Parameter sets that differ in every scale: mass, gravity, friction, impratio,
+# solref time constant, solimp width, condim.
+_ELLIPTIC_SETS = (dict(m=1.0, g=9.81, mu=0.5, ir=1.0, tc=0.02, w=0.001, c=3),
+                  dict(m=10.0, g=30.0, mu=1.2, ir=3.0, tc=0.05, w=0.005, c=4),
+                  dict(m=0.2, g=5.0, mu=0.3, ir=1.5, tc=0.03, w=0.002, c=6))
+
+
+def _elliptic_box(**params):
+  p = dict(_ELLIPTIC_DEFAULT, **params)
+  m = mujoco.MjModel.from_xml_string(_ELLIPTIC_XML.format(**p))
+  d = _resting_data(m)
+  mx = mjx.put_model(m)
+  return m, d, mx, mjx.forward(mx, mjx.put_data(m, d))
+
+
+def _elliptic_reference_cost(y, d0, ell, friction, mu, slip, lift):
+  """MuJoCo's elliptic cost, smoothed, written out independently (one contact).
+
+  Scaled coordinates ``n = mu y_0``, ``t_j = f_j y_j``; the hard cost is
+  ``D_m / 2 [relu(mu |t| - n)**2 + mu**2 relu(-n - |t| / mu)**2]``.
+  """
+  n = mu * y[0]
+  rho = jp.linalg.norm(friction * y[1:])
+  dm = d0 / (mu**2 * (1.0 + mu**2))
+  k1, k2 = n - mu * rho, n + rho / mu
+  if lift == 0:  # the l0 -> 0 limit: tau = slip * max(-n, 0), hard once unloaded
+    tau = slip * jp.maximum(-n, 0.0)
+    safe = jp.where(tau > 0, tau, 1.0)
+    h = lambda k: safe**2 * solver._softplus_integral(-k / safe)
+    hard = 0.5 * dm * (jp.maximum(-k1, 0.0) ** 2 + mu**2 * jp.maximum(-k2, 0.0) ** 2)
+    return jp.where(tau > 0, dm * (h(k1) + mu**2 * h(k2)), hard)
+  l0 = lift * mu * ell / (1.0 + np.log(2.0))
+  tau = l0 * (1.0 + jp.logaddexp(0.0, slip * -n / l0))
+  h = lambda k: tau**2 * solver._softplus_integral(-k / tau)
+  return dm * (h(k1) + mu**2 * h(k2))
+
+
+class EllipticContactCostTest(absltest.TestCase):
+  """Elliptic cone: minus the gradient of MuJoCo's elliptic cost, smoothed at
+  its two kinks (liftoff, stick/slip) with the contact's band, convex and
+  smooth at zero tangential acceleration; liftoff in solimp widths and
+  stick/slip in friction utilization."""
+
+  _S = 0.2
+
+  def _random_contact(self, rng, condim):
+    mu = rng.uniform(0.1, 2.0)
+    impratio = rng.uniform(1.0, 3.0)
+    friction = jp.asarray(rng.uniform(0.001, 1.5, size=condim - 1)).at[0].set(mu * np.sqrt(impratio))
+    return mu, friction, rng.uniform(0.5, 50.0), rng.uniform(0.5, 5.0)
+
+  def test_two_kink_form_is_mujocos_cost(self):
+    """As the bands vanish, the force is MJX's hard elliptic force (three
+    zones), so the two-kink split and the friction rows' D are MuJoCo's."""
+    rng = np.random.default_rng(0)
+    for p in _ELLIPTIC_SETS:
+      _, _, mx, dx = _elliptic_box(**p)
+      ctx = solver.Context.create(mx, dx, grad=False)
+      for _ in range(20):
+        y = jp.asarray(rng.normal(size=dx._impl.nefc) * 10.0 ** rng.uniform(-1, 2))
+        hard = solver._update_constraint(mx, dx, ctx.replace(Jaref=y)).efc_force
+        tiny = solver._update_constraint(mx, dx, ctx.replace(Jaref=y), stickslip_softness=1e-9,
+                                         liftoff_softness=1e-9).efc_force
+        np.testing.assert_allclose(tiny, hard, rtol=0, atol=1e-12 * float(jp.max(jp.abs(hard))), err_msg=str(p))
+
+  def test_force_is_minus_gradient_and_hessian_is_psd(self):
+    rng = np.random.default_rng(1)
+    for slip, lift in ((0.2, 0.05), (0.05, 0.01), (1.0, 1.0), (0.0, 0.3), (0.3, 0.0)):
+      for condim in (3, 4, 6):
+        for _ in range(15):
+          mu, friction, d0, ell = self._random_contact(rng, condim)
+          y = jp.asarray(rng.normal(size=condim) * 10.0 ** rng.uniform(-2, 1))
+          if lift == 0:
+            y = y.at[0].set(-abs(float(y[0])))  # loaded: off the zero-band kink at n = 0
+          args = (d0, ell, friction, mu, slip, lift)
+          force = solver._elliptic_group_force(y[None], jp.full((1, condim), d0), jp.asarray([ell]),
+                                               friction[None], jp.asarray([mu]), slip, lift)[0]
+          grad = jax.grad(_elliptic_reference_cost)(y, *args)
+          np.testing.assert_allclose(force, -grad, rtol=1e-9, atol=1e-9 * (float(jp.max(jp.abs(grad))) + 1))
+          hess = np.asarray(jax.hessian(_elliptic_reference_cost)(y, *args))
+          np.testing.assert_allclose(hess, hess.T, atol=1e-9 * np.abs(hess).max())
+          self.assertGreaterEqual(np.linalg.eigvalsh(hess).min(), -1e-9 * np.abs(hess).max(),
+                                  msg=(slip, lift, condim))
+
+  def test_tangent_rule_matches_autodiff(self):
+    """The analytic tangent rule (y, D, friction and mu tangents) against
+    forward-mode autodiff of minus the gradient of the reference cost."""
+    rng = np.random.default_rng(5)
+    for slip, lift in ((0.2, 0.05), (0.05, 0.01), (1.0, 1.0), (0.0, 0.3), (0.3, 0.0)):
+      for condim in (3, 4, 6):
+        for _ in range(8):
+          mu, friction, d0, ell = self._random_contact(rng, condim)
+          y = jp.asarray(rng.normal(size=condim) * 10.0 ** rng.uniform(-2, 1))
+          if lift == 0 and rng.uniform() < 0.5:
+            y = y.at[0].set(-abs(float(y[0])))  # loaded; otherwise unloaded (hard)
+          dd = jp.full(condim, d0)
+          ref = lambda y_, dd_, f_, m_: -jax.grad(_elliptic_reference_cost)(y_, dd_[0], ell, f_, m_, slip, lift)
+          got = lambda y_, dd_, f_, m_: solver._elliptic_group_force(
+              y_[None], dd_[None], jp.asarray([ell]), f_[None], jp.asarray([m_]), slip, lift)[0]
+          primals = (y, dd, friction, jp.asarray(mu))
+          tangents = (jp.asarray(rng.normal(size=condim)), jp.asarray(rng.normal(size=condim)),
+                      jp.asarray(rng.normal(size=condim - 1)), jp.asarray(rng.normal()))
+          for mask in ((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 1), (1, 1, 1, 1)):
+            tan = tuple(t if k else jp.zeros_like(t) for t, k in zip(tangents, mask))
+            f0, t0 = jax.jvp(ref, primals, tan)
+            f1, t1 = jax.jvp(got, primals, tan)
+            np.testing.assert_allclose(f1, f0, rtol=1e-9, atol=1e-9 * (float(jp.max(jp.abs(f0))) + 1))
+            np.testing.assert_allclose(t1, t0, rtol=1e-8, atol=1e-8 * (float(jp.max(jp.abs(t0))) + 1),
+                                       err_msg=f'{slip} {lift} condim {condim} tangents {mask}')
+
+  def test_tangent_rule_second_derivative(self):
+    """The tangent rule is itself differentiable and matches the reference."""
+    rng = np.random.default_rng(6)
+    mu, friction, d0, ell = self._random_contact(rng, 4)
+    y = jp.asarray(rng.normal(size=4) * 2.0)
+    w = jp.asarray(rng.normal(size=4))
+    got = lambda y_: jp.sum(w * solver._elliptic_group_force(
+        y_[None], jp.full((1, 4), d0), jp.asarray([ell]), friction[None], jp.asarray([mu]), 0.2, 0.05)[0])
+    ref = lambda y_: -jp.sum(w * jax.grad(_elliptic_reference_cost)(y_, d0, ell, friction, mu, 0.2, 0.05))
+    np.testing.assert_allclose(jax.hessian(got)(y), jax.hessian(ref)(y), rtol=1e-7,
+                               atol=1e-7 * float(jp.max(jp.abs(jax.hessian(ref)(y)))))
+
+  def test_smooth_at_zero_tangential_acceleration(self):
+    """One band for both kinks: the cost is differentiable at t = 0 (its
+    Jacobian there is finite and the limit of nearby ones), in float64 and
+    float32."""
+    friction, mu = jp.asarray([0.6, 0.6, 0.01]), jp.asarray([0.6])
+    d, ell = jp.full((1, 4), 10.0), jp.asarray([2.0])
+    for slip, lift in ((0.2, 0.05), (0.2, 0.0), (0.0, 0.2)):
+      fn = lambda y: solver._elliptic_group_force(y[None], d, ell, friction[None], mu, slip, lift)[0]
+      for n0 in (-2.0, -0.01, 0.5):
+        j0 = jax.jacfwd(fn)(jp.asarray([n0, 0.0, 0.0, 0.0]))
+        j1 = jax.jacfwd(fn)(jp.asarray([n0, 1e-7, 0.0, 0.0]))
+        self.assertTrue(np.all(np.isfinite(np.asarray(j0))))
+        np.testing.assert_allclose(j0, j1, atol=1e-5 * float(jp.max(jp.abs(j0))) + 1e-9, err_msg=f'{slip} {lift} {n0}')
+      f32 = lambda y: solver._elliptic_group_force(
+          y[None], d.astype(jp.float32), ell.astype(jp.float32), friction[None].astype(jp.float32),
+          mu.astype(jp.float32), slip, lift)[0]
+      for y in ([-1.0, 0, 0, 0], [-1e-30, 0, 0, 0], [0.0, 0, 0, 0], [-1e-12, 1e3, -1e3, 1.0], [5.0, 1e-20, 0, 0]):
+        y = jp.asarray(y, jp.float32)
+        f, t = jax.jvp(f32, (y,), (jp.ones_like(y),))
+        self.assertTrue(np.all(np.isfinite(np.asarray(f))) and np.all(np.isfinite(np.asarray(t))), msg=str(y))
+
+  def test_float32_matches_float64(self):
+    rng = np.random.default_rng(2)
+    for slip, lift in ((0.1, 0.1), (0.3, 0.01)):
+      mu, friction, d0, ell = self._random_contact(rng, 4)
+      y = jp.asarray(rng.normal(size=(5, 4)) * 3.0)
+      args64 = (jp.full((5, 4), d0), jp.full(5, ell), jp.tile(friction, (5, 1)), jp.full(5, mu))
+      f64 = solver._elliptic_group_force(y, *args64, slip, lift)
+      f32 = solver._elliptic_group_force(y.astype(jp.float32), *(a.astype(jp.float32) for a in args64), slip, lift)
+      self.assertEqual(f32.dtype, jp.float32)
+      np.testing.assert_allclose(f32, f64, rtol=2e-5, atol=2e-5 * float(jp.max(jp.abs(f64))))
+
+  def test_zero_liftoff_softness_keeps_liftoff_hard(self):
+    """liftoff_softness = 0: unloaded contacts get exactly MJX's hard force."""
+    _, _, mx, dx = _elliptic_box()
+    ctx = solver.Context.create(mx, dx, grad=False)
+    rng = np.random.default_rng(3)
+    groups = solver._contact_edge_groups(mx)
+    (start, ncon, rows), = groups
+    for _ in range(10):
+      y = jp.asarray(rng.normal(size=dx._impl.nefc) * 3.0)
+      normals = start + rows * np.arange(ncon)
+      y = y.at[normals[:2]].set(jp.abs(y[normals[:2]])).at[normals[2:]].set(-jp.abs(y[normals[2:]]))
+      hard = solver._update_constraint(mx, dx, ctx.replace(Jaref=y)).efc_force
+      soft = solver._update_constraint(mx, dx, ctx.replace(Jaref=y), stickslip_softness=0.2).efc_force
+      unloaded = slice(start, start + 2 * rows)
+      np.testing.assert_allclose(soft[unloaded], hard[unloaded], rtol=1e-13, atol=1e-13)
+      self.assertFalse(np.allclose(soft[start + 2 * rows:], hard[start + 2 * rows:]))
+
+  def _mask_fn(self, p, **soft):
+    m, d, mx, dx = _elliptic_box(**p)
+    ctx = solver.Context.create(mx, dx, grad=False)
+    f = lambda y: solver._update_constraint(mx, dx, ctx.replace(Jaref=y), **soft).efc_force
+    (start, _, rows), = solver._contact_edge_groups(mx)
+
+    def mask(rows_y, row):
+      """-d f_row / d y_row / D_row for contact 0's rows set to rows_y."""
+      y = jp.zeros(dx._impl.nefc).at[start : start + rows].set(rows_y)
+      e = jp.zeros(dx._impl.nefc).at[start + row].set(1.0)
+      return -float(jax.jvp(f, (y,), (e,))[1][start + row]) / float(dx._impl.efc_D[start + row])
+
+    # MuJoCo C's own scale of the normal row: K * I * solimp width.
+    ell = float(d.efc_KBIP[start, 0] * d.efc_KBIP[start, 2]) * p['w']
+    mu = float(dx._impl.contact.friction[0, 0]) / np.sqrt(p['ir'])
+    return mask, ell, mu, float(dx._impl.contact.friction[0, 0]), rows
+
+  def test_liftoff_in_solimp_widths(self):
+    """With no tangential motion, the normal row's mask traces the same curve
+    in solimp widths y_0 / (s_liftoff K I width) for every parameter set."""
+    z = np.linspace(-4.0, 4.0, 33)
+    curves = []
+    for p in _ELLIPTIC_SETS:
+      mask, ell, _, _, rows = self._mask_fn(p, stickslip_softness=self._S, liftoff_softness=self._S)
+      curves.append([mask(jp.zeros(rows).at[0].set(v), 0) for v in -z * self._S * ell])
+    np.testing.assert_allclose(curves[1:], [curves[0]] * 2, atol=1e-12)
+    self.assertTrue(np.all(np.diff(curves[0]) > 0))  # off (separating) -> on (pressed)
+
+  def test_stick_slip_in_friction_utilization(self):
+    """Loaded far past the cone's apex, the stick/slip transition of the
+    tangential mask is the same curve in utilization U = |t| / (mu |n|) for
+    every load and parameter set. The tangential mask goes from 1 (sticking)
+    to mu**2 / (1 + mu**2) (sliding, MuJoCo's cone), so it is compared as
+    phi = (1 + mu**2) mask - mu**2, from 1 to 0."""
+    s = 0.1  # keeps the liftoff kink's tail (~exp(-1/s)) out of the comparison
+    u = np.linspace(0.0, 2.0, 21)
+    curves = []
+    for p in _ELLIPTIC_SETS:
+      mask, ell, mu, f1, rows = self._mask_fn(p, stickslip_softness=s, liftoff_softness=s)
+      l0 = s * ell / (1.0 + np.log(2.0))  # the band's floor, in y_0 units
+      for load in (1e3, 1e5):
+        y0 = -load * l0 / s
+        # |n| = mu |y_0|, |t| = f_1 |y_1| = U mu |n|
+        mk = lambda uu: jp.zeros(rows).at[0].set(y0).at[1].set(uu * mu * mu * -y0 / f1)
+        curves.append([(1 + mu * mu) * mask(mk(uu), 1) - mu * mu for uu in u])
+    np.testing.assert_allclose(curves[1:], [curves[0]] * (len(curves) - 1), atol=1e-3)
+    self.assertTrue(np.all(np.diff(curves[0]) < 0))
+    self.assertGreater(curves[0][0], 0.99)
+    self.assertLess(curves[0][-1], 1e-3)
+
+  def test_ift_gradient_is_derivative_of_smoothed_root(self):
+    """End to end (condim 3, 4, 6): with refinement converged, the IFT
+    gradient equals the finite-difference derivative of the smoothed root."""
+    slip, lift = 0.2, 0.05
+    for condim in (3, 4, 6):
+      m, d, base, _ = _elliptic_box(c=condim)
+      dx = mjx.put_data(m, d)
+      mk = lambda **o: base.replace(opt=base.opt.replace(**o))
+      soft = mk(stickslip_softness=slip, liftoff_softness=lift)
+      refined = mk(stickslip_softness=slip, liftoff_softness=lift, refinement_iterations=30,
+                   refinement_ls_iterations=8, refinement_fallback_enable=False)
+      hard = mk()
+
+      def smoothed_root(dof, force):
+        dd = jax.jit(mjx.forward)(hard, dx.replace(qfrc_applied=dx.qfrc_applied.at[dof].set(force)))
+        root = jax.jit(lambda q: solver._root(soft, dd, q))
+        jac = jax.jit(jax.jacfwd(lambda q: solver._root(soft, dd, q)))
+        q = dd.qacc
+        for _ in range(60):
+          q = q - jp.linalg.solve(jac(q), root(q))
+        self.assertLess(float(jp.linalg.norm(root(q))), 1e-8)
+        return float(q[dof])
+
+      h = 1e-5
+      # push x (stick/slip, threshold ~4.9), twist about z (torsion), lift z (liftoff)
+      cases = [(0, (1.0, 4.9, 8.0)), (2, (5.0, 9.81, 12.0))]
+      if condim > 3:
+        cases.append((5, (0.002, 0.01)))
+      for dof, forces in cases:
+        grad = _slope(refined, dx, dof, np.array(forces))
+        fd = np.array([(smoothed_root(dof, f_ + h) - smoothed_root(dof, f_ - h)) / (2 * h) for f_ in forces])
+        np.testing.assert_allclose(grad, fd, rtol=1e-4, atol=1e-7, err_msg=f'condim {condim} dof {dof}')
+
+  def test_contact_groups_and_whole_contact_selection(self):
+    """Elliptic rows: condim per contact, normal first. Friction rows have
+    efc_pos 0, so the in-contact selection follows each contact's normal row."""
+    m = mujoco.MjModel.from_xml_string(_CONDIM_XML.replace('cone="pyramidal"', 'cone="elliptic"'))
+    mx = mjx.put_model(m)
+    dx = mjx.forward(mx, mjx.put_data(m, _resting_data(m)))
+    groups = solver._contact_edge_groups(mx)
+    self.assertEqual([g[2] for g in groups], [1, 3, 4, 6])
+    efc_type, pos = np.asarray(dx._impl.efc_type), np.asarray(dx._impl.efc_pos)
+    margin = np.asarray(dx._impl.efc_margin)
+    nominal = np.asarray(solver._nominal_contact_rows(mx, dx))
+    for start, ncon, rows in groups:
+      want = (mujoco.mjtConstraint.mjCNSTR_CONTACT_FRICTIONLESS if rows == 1
+              else mujoco.mjtConstraint.mjCNSTR_CONTACT_ELLIPTIC)
+      blk = slice(start, start + ncon * rows)
+      self.assertTrue(np.all(efc_type[blk] == int(want)))
+      p, mg = pos[blk].reshape(ncon, rows), margin[blk].reshape(ncon, rows)
+      in_contact = p[:, 0] < mg[:, 0]
+      self.assertTrue(in_contact.any())
+      if rows > 1:
+        np.testing.assert_array_equal(p[:, 1:], 0.0)  # friction rows: efc_pos 0
+      # Every row of a contact follows its normal row.
+      np.testing.assert_array_equal(nominal[blk].reshape(ncon, rows), np.repeat(in_contact[:, None], rows, 1))
+    self.assertEqual(groups[-1][0] + groups[-1][1] * groups[-1][2], efc_type.shape[0])
+
+  def test_contact_scale_is_k_imp_width(self):
+    """efc_softness_scale of an elliptic contact's normal row is MuJoCo's K I width."""
+    m, d, _, dx = _elliptic_box()
+    scale = np.asarray(dx._impl.efc_softness_scale)
+    for c in range(d.ncon):
+      a = int(dx._impl.contact.efc_address[c])
+      np.testing.assert_allclose(scale[a], d.efc_KBIP[a, 0] * d.efc_KBIP[a, 2] * m.geom_solimp[0, 2], rtol=1e-6)
+
+
 _COORD_HINGE = """
 <mujoco>
   <option timestep="0.002" iterations="100" tolerance="1e-12" gravity="0 0 0"/>
@@ -1132,8 +1444,12 @@ class BackwardImplementationTest(absltest.TestCase):
     smooth = dict(stickslip_softness=0.2, liftoff_softness=0.05, limit_softness=0.1, frictionloss_softness=0.1)
     for cone in ('pyramidal', 'elliptic'):
       mx, dx = _mixed(cone)
-      soft = dict(smooth) if cone == 'pyramidal' else dict(limit_softness=0.1, frictionloss_softness=0.1)
-      out += [(f'mixed {cone} hard', mx, dx), (f'mixed {cone} smoothed', mx.replace(opt=mx.opt.replace(**soft)), dx)]
+      out += [(f'mixed {cone} hard', mx, dx), (f'mixed {cone} smoothed', mx.replace(opt=mx.opt.replace(**smooth)), dx)]
+    m = mujoco.MjModel.from_xml_string(_CONDIM_XML.replace('cone="pyramidal"', 'cone="elliptic"'))
+    mx = mjx.put_model(m)
+    dx = jax.jit(mjx.forward)(mx, mjx.put_data(m, _resting_data(m)))
+    out += [('elliptic condim 1/3/4/6 smoothed',
+             mx.replace(opt=mx.opt.replace(stickslip_softness=0.2, liftoff_softness=0.05)), dx)]
     m = mujoco.MjModel.from_xml_string(_CONDIM_XML)
     mx = mjx.put_model(m)
     dx = jax.jit(mjx.forward)(mx, mjx.put_data(m, _resting_data(m)))
@@ -1188,9 +1504,7 @@ class BackwardImplementationTest(absltest.TestCase):
 class RefinementNewtonStepTest(absltest.TestCase):
   """The structured Newton step is exact for both cones; absent row types are pruned."""
 
-  # Elliptic: contact smoothing is pyramidal-only, so limit and friction loss.
-  _CASES = (('pyramidal', _ALL_SOFTNESSES),
-            ('elliptic', dict(limit_softness=0.1, frictionloss_softness=0.1)))
+  _CASES = (('pyramidal', _ALL_SOFTNESSES), ('elliptic', _ALL_SOFTNESSES))
 
   def test_newton_step_matches_autodiff(self):
     """Residual, Newton direction (so the Jacobian) and line-search derivatives
@@ -1229,14 +1543,13 @@ class RefinementNewtonStepTest(absltest.TestCase):
         np.testing.assert_allclose(fast, generic, rtol=1e-10, atol=1e-12, err_msg=cone)
 
   def test_elliptic_refinement_converges_to_smoothed_root(self):
-    """Elliptic cone (limit and friction-loss smoothing): refinement gives the
-    derivative of the smoothed root, like the pyramidal path."""
-    softnesses = dict(limit_softness=0.1, frictionloss_softness=0.1)
-    mx, dx = _mixed('elliptic', refinement_iterations=12, **softnesses)
+    """Elliptic cone (contact, limit and friction-loss smoothing): refinement
+    gives the derivative of the smoothed root, like the pyramidal path."""
+    mx, dx = _mixed('elliptic', refinement_iterations=12, **_ALL_SOFTNESSES)
     soft_only = mx.replace(opt=mx.opt.replace(refinement_iterations=0))
     hard = mx.replace(opt=mx.opt.replace(
-        refinement_iterations=0, limit_softness=0.0,
-        frictionloss_softness=0.0))
+        refinement_iterations=0, stickslip_softness=0.0, liftoff_softness=0.0,
+        limit_softness=0.0, frictionloss_softness=0.0))
     dof = 6  # the hinge
     def smoothed_root(torque):
       d = dx.replace(qfrc_applied=dx.qfrc_applied.at[dof].set(torque))
