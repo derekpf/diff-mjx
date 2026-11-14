@@ -257,17 +257,13 @@ class SoftCollisionTest(parameterized.TestCase):
     for actual, expected in zip(straight_through, hard):
       np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5,
                                  err_msg=name)
+    # Collision detection is always hard (see collision_primitive.collider and
+    # collision_convex.collider), so requesting a soft mode without contact ST
+    # also gives the hard contacts.
     soft = contact(mode, False)
-    for value in soft:
-      self.assertTrue(np.all(np.isfinite(np.asarray(value))), name)
-    # These fixtures lie inside a smoothing band.  Other fixtures can have
-    # identical hard and soft values, especially with compact C2 smoothing.
-    if mode == 'smooth' and name in (
-        'plane_capsule', 'plane_cylinder_parallel',
-        'sphere_sphere', 'sphere_sphere_coincident', 'sphere_capsule', 'box_box'
-    ):
-      self.assertTrue(any(not np.allclose(a, b, atol=1e-5, rtol=1e-5)
-                          for a, b in zip(soft, straight_through)), name)
+    for actual, expected in zip(soft, hard):
+      np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5,
+                                 err_msg=name)
 
     model = mx.replace(opt=mx.opt.replace(
         softjax_mode=mode, contact_st_enable=True, pw_solimp=None

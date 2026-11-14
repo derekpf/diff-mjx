@@ -82,19 +82,11 @@ inputs. These defaults stay unchanged.
 
 ## diff-mjx changes
 
-- **Per-operation ST wiring.** Propagates `opt.contact_st_enable` (default `False`) through softened collision and contact-physics operations, preserving nominal hard forward values while using surrogate gradients.
+- **Per-operation ST wiring.** Propagates `opt.contact_st_enable` (default `False`) through softened contact-physics operations, preserving nominal hard forward values while using surrogate gradients. Collision detection itself is always hard (below).
 
 - **Closer nominal MJX behavior.** Corrects collision feature selection, tie-breaking, normalization, contact masks, duplicate contacts, and sign conventions.
 
-- **Plane–cylinder degenerate-vector gate.** Uses softness `1e-8`.
-
-- **Capsule–capsule gate.** Uses softness `4e-8`.
-
-- **Box–box SAT softness.** Uses `7e-5` for SAT and `2e-5` for other operations.
-
-- **Plane–convex selection is hard.** Plane–box and plane–mesh contacts always select their contact vertices with the nominal hard rule, in every `softjax_mode`, so distance and position gradients come only from the selected vertices' geometry. The softened selection (at softness `1e-6`) produced distance gradients up to ~1e5 for separated vertices near selection boundaries, which flat contact faces sit on. With `pw_solimp` these contacts enter the dynamics, and BPTT through G1 and Berkeley Humanoid diverged. Over 2M PatSappo steps, hard selection learned faster on both.
-
-- **Soft validity gradients retained.** Removes forced gradient stops around box–box candidate validity, manifold masks, and contact counts.
+- **Collision detection is hard for every pair.** Both `collider` decorators (`collision_primitive.py`, `collision_convex.py`) call every collision function with `soft=False`, in every `softjax_mode` and with or without `contact_st_enable`, so contact selection always follows the nominal hard rule. Softened selection (sign, threshold and layout switches, deepest-vertex and manifold choice) has surrogate derivatives that scale with the inverse softness at selection boundaries, and resting contacts sit on those boundaries: plane–convex selection at softness `1e-6` gave distance gradients up to ~1e5 for separated vertices of flat faces (BPTT through G1 and Berkeley Humanoid diverged), and the plane–cylinder layout switch at softness `1e-3` gave contact-position derivatives ~100x the rigid-body scale for a cylinder lying on its side. The per-pair soft code paths remain in the source but are not reached.
 
 - **Numerical safeguards.** Adds finite-gradient protection for C2 clipping, coincident contacts, cylinder SDF derivatives, tendon wrapping, and muscle smoothing while retaining nominal forwards.
 

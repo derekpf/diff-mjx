@@ -72,12 +72,18 @@ def collider(ncon: int):
           infos[i] = hfield_info.replace(pos=infos[i].pos, mat=infos[i].mat)
           in_axes[i] = hfield_info.replace(pos=0, mat=0, data=None)
           fn = functools.partial(fn, subgrid_size=key.subgrid_size)
-      softjax_mode = m.opt.softjax_mode
+      # Collision detection is always hard for every pair: the softened
+      # contact selection's surrogate derivatives scale with the inverse
+      # softness at selection boundaries, which resting contacts sit on.
+      # softjax_mode = m.opt.softjax_mode
       fn = functools.partial(
           fn,
-          soft=softjax_mode is not None,
-          softjax_mode=softjax_mode,
-          st_enable=m.opt.contact_st_enable,
+          # soft=softjax_mode is not None,
+          # softjax_mode=softjax_mode,
+          # st_enable=m.opt.contact_st_enable,
+          soft=False,
+          softjax_mode=None,
+          st_enable=False,
       )
       dist, pos, frame = jax.vmap(fn, in_axes=in_axes)(*infos)  # pytype: disable=wrong-keyword-args
       if ncon > 1:
