@@ -38,12 +38,18 @@ def collider(ncon: int):
       g1, g2 = geom.T
       info1 = GeomInfo(d.geom_xpos[g1], d.geom_xmat[g1], m.geom_size[g1])
       info2 = GeomInfo(d.geom_xpos[g2], d.geom_xmat[g2], m.geom_size[g2])
-      softjax_mode = m.opt.softjax_mode
+      # Collision detection is always hard for every pair: the softened
+      # contact selection's surrogate derivatives scale with the inverse
+      # softness at selection boundaries, which resting contacts sit on.
+      # softjax_mode = m.opt.softjax_mode
       fn = functools.partial(
           func,
-          soft=softjax_mode is not None,
-          softjax_mode=softjax_mode,
-          st_enable=m.opt.contact_st_enable,
+          # soft=softjax_mode is not None,
+          # softjax_mode=softjax_mode,
+          # st_enable=m.opt.contact_st_enable,
+          soft=False,
+          softjax_mode=None,
+          st_enable=False,
       )
       dist, pos, frame = jax.vmap(fn)(info1, info2)
       if ncon > 1:

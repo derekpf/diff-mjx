@@ -14,7 +14,6 @@
 # ==============================================================================
 """Tests for io functions."""
 
-import os
 import tempfile
 from unittest import mock
 
@@ -147,7 +146,7 @@ class ModelIOTest(parameterized.TestCase):
       xml=(_MULTIPLE_CONVEX_OBJECTS, _MULTIPLE_CONSTRAINTS),
       impl=('jax', 'warp', 'cpp'),
   )
-  @mock.patch.dict(os.environ, {'MJX_GPU_DEFAULT_WARP': 'true'})
+  @mock.patch.object(mjx_io, '_gpu_default_warp', new=lambda: True)
   def test_put_model(self, xml, impl):
     if impl == 'warp' and not mjxw.WARP_INSTALLED:
       self.skipTest('Warp not installed.')
@@ -488,7 +487,7 @@ class DataIOTest(parameterized.TestCase):
     self.assertEqual(d._impl.qLDiagInv.shape, (nv,))
 
 
-  @mock.patch.dict(os.environ, {'MJX_GPU_DEFAULT_WARP': 'true'})
+  @mock.patch.object(mjx_io, '_gpu_default_warp', new=lambda: True)
   def test_make_data_warp(self):
     if not mjxw.WARP_INSTALLED:
       self.skipTest('Warp is not installed.')
@@ -1051,7 +1050,7 @@ class ResolveImplAndDeviceTest(parameterized.TestCase):
   @parameterized.named_parameters(
       (f'{str(args[0])}_{str(args[1])}', *args) for args in _DEVICE_TEST_CASES
   )
-  @mock.patch.dict(os.environ, {'MJX_GPU_DEFAULT_WARP': 'true'})
+  @mock.patch.object(mjx_io, '_gpu_default_warp', new=lambda: True)
   def test_resolve_with_device(
       self,
       device_type_str,
@@ -1123,7 +1122,7 @@ class ResolveImplAndDeviceTest(parameterized.TestCase):
       (f'{str(args[0])}_{str(args[1])}', *args)
       for args in _DEFAULT_DEVICE_TEST_CASES
   )
-  @mock.patch.dict(os.environ, {'MJX_GPU_DEFAULT_WARP': 'true'})
+  @mock.patch.object(mjx_io, '_gpu_default_warp', new=lambda: True)
   def test_resolve_without_device(
       self,
       default_device_str,
@@ -1199,7 +1198,7 @@ class ResolveImplAndDeviceTest(parameterized.TestCase):
     self.assertIsNotNone(actual_device)
     self.assertEqual(actual_device.platform, expected_device)
 
-  @mock.patch.dict(os.environ, {'MJX_GPU_DEFAULT_WARP': 'false'})
+  @mock.patch.object(mjx_io, '_gpu_default_warp', new=lambda: False)
   def test_resolve_warp_disabled(self):
     """Tests behavior when MJX_GPU_DEFAULT_WARP is false."""
     if not mjxw.WARP_INSTALLED:

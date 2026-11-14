@@ -759,6 +759,7 @@ def make_constraint(m: Model, d: Data, soft: bool = False) -> Data:
         '_impl.efc_D': z,
         '_impl.efc_aref': z,
         '_impl.efc_frictionloss': z,
+        '_impl.efc_softness_scale': z,
         '_impl.efc_pos': z,
         '_impl.efc_margin': z,
     })
@@ -774,12 +775,23 @@ def make_constraint(m: Model, d: Data, soft: bool = False) -> Data:
     if soft:
       pos_aref = jp.where(is_contact, -jax.nn.relu(-pos_aref), pos_aref)
     aref = -b * (efc.J @ d.qvel) - k * imp * pos_aref
-    return aref, r, efc.pos_aref + efc.margin, efc.margin, efc.frictionloss
+    # Constraint cost smoothing length scale, in this row's own Jaref units: the
+    # stick half-window r * frictionloss for friction-loss rows, else the
+    # reference acceleration k * imp * width of a penetration one solimp width
+    # deep. All rows of one contact share solref, solimp and position, so
+    # pyramid edges share it and the cone keeps its shape.
+    width = jp.maximum(efc.solimp[2], mujoco.mjMINVAL)
+    scale = jp.where(efc.frictionloss > 0, r * efc.frictionloss, k * imp * width)
+    scale = jp.maximum(scale, mujoco.mjMINVAL)
+    return (
+        aref, r, efc.pos_aref + efc.margin, efc.margin, efc.frictionloss, scale
+    )
 
   is_contact = d._impl.efc_type >= ConstraintType.CONTACT_FRICTIONLESS
-  aref, r, pos, margin, frictionloss = fn(efc, is_contact)
+  aref, r, pos, margin, frictionloss, scale = fn(efc, is_contact)
   d = d.tree_replace({
       '_impl.efc_J': efc.J,
+      '_impl.efc_softness_scale': scale,
       '_impl.efc_D': 1 / r,
       '_impl.efc_aref': aref,
       '_impl.efc_pos': pos,

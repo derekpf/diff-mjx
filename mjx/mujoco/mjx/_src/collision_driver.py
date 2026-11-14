@@ -456,5 +456,18 @@ def collision(m: Model, d: Data) -> Data:
 
   contacts = sum([condim_groups[k] for k in sorted(condim_groups)], [])
   contact = jax.tree_util.tree_map(lambda *x: jp.concatenate(x), *contacts)
+  # The contact frame (normal and tangents) and the contact position are held
+  # constant in the backward pass for every collision pair and every consumer
+  # (constraint rows, contact sensors, rne_postconstraint); only the distance
+  # keeps its gradient. Their derivatives (the normal rotating and the contact
+  # point sliding as the bodies move, e.g. at limb-torso self-collisions near a
+  # cylinder rim) compounded through the contact Jacobian into BPTT gradients
+  # of 1e6-1e10 in resting multi-contact states, and re-entered the objective
+  # through sensors built from contact forces (the accelerometer, via
+  # rne_postconstraint) when held only in the constraint rows.
+  contact = contact.replace(
+      frame=jax.lax.stop_gradient(contact.frame),
+      pos=jax.lax.stop_gradient(contact.pos),
+  )
 
   return d.tree_replace({'_impl.contact': contact})

@@ -45,7 +45,6 @@ def _worker(cfg: Config) -> dict:
   if cfg.backend not in BACKENDS:
     raise ValueError(f'unknown backend {cfg.backend!r}')
   backend = cfg.backend
-  os.environ['MJX_GRAD_BACKEND'] = backend
   import jax  # pylint: disable=g-import-not-at-top
   from jax import numpy as jp  # pylint: disable=g-import-not-at-top
   import numpy as np  # pylint: disable=g-import-not-at-top
@@ -57,7 +56,8 @@ def _worker(cfg: Config) -> dict:
   mx = env.mjx_model
   opt = mx.opt.replace(
       softjax_mode='smooth', pw_solimp=jp.array([0.0, 0.8, 1.0, 1.0, 10.0]),
-      contact_st_enable=True, sensor_softness=0.0, sensor_st_enable=False)
+      contact_st_enable=True, sensor_softness=0.0, sensor_st_enable=False,
+      grad_backend=backend)
   if cfg.iterations:
     opt = opt.replace(iterations=cfg.iterations)
   env._mjx_model = mx.replace(opt=opt)  # pylint: disable=protected-access

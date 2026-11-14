@@ -57,16 +57,18 @@ def _check_warp_installed():
     )
 
 
+def _gpu_default_warp() -> bool:
+  """Whether ``MJX_GPU_DEFAULT_WARP`` makes Warp the default on CUDA GPUs."""
+  # TODO(btaba): Remove flag once Warp is ready for GPU default.
+  return os.environ.get('MJX_GPU_DEFAULT_WARP', 'f').lower() == 'true'
+
+
 def _resolve_impl(
     device: jax.Device,
 ) -> types.Impl:
   """Pick a default implementation based on the device specified."""
   if _is_cuda_gpu_device(device):
-    # TODO(btaba): Remove flag once Warp is ready for GPU default.
-    mjx_gpu_default_warp = (
-        os.environ.get('MJX_GPU_DEFAULT_WARP', 'f').lower() == 'true'
-    )
-    if mjx_gpu_default_warp and mjxw.WARP_INSTALLED:
+    if _gpu_default_warp() and mjxw.WARP_INSTALLED:
       logging.debug('Picking default implementation: Warp.')
       return types.Impl.WARP
 
@@ -255,9 +257,30 @@ def _put_option(
   fields['contact_st_enable'] = bool(getattr(o, 'contact_st_enable', False))
   fields['sensor_softness'] = float(getattr(o, 'sensor_softness', 0.0))
   fields['sensor_st_enable'] = bool(getattr(o, 'sensor_st_enable', False))
+  for name in (
+      'stickslip_softness',
+      'liftoff_softness',
+      'limit_softness',
+      'frictionloss_softness',
+  ):
+    fields[name] = float(getattr(o, name, 0.0))
+  fields['refinement_iterations'] = int(
+      getattr(o, 'refinement_iterations', 0)
+  )
+  fields['refinement_tolerance'] = float(
+      getattr(o, 'refinement_tolerance', 1e-6)
+  )
+  fields['refinement_ls_iterations'] = int(
+      getattr(o, 'refinement_ls_iterations', 0)
+  )
+  fields['refinement_fallback_enable'] = bool(
+      getattr(o, 'refinement_fallback_enable', True)
+  )
   pw_solimp = getattr(o, 'pw_solimp', None)
   fields['pw_solimp'] = None if pw_solimp is None else jp.array(pw_solimp)
   fields['scan_loop'] = bool(getattr(o, 'scan_loop', True))
+  # Gradient backend of the constraint solve (see solver.grad_backend).
+  fields['grad_backend'] = getattr(o, 'grad_backend', 'ift')
 
   option_obj = {
       types.Impl.JAX: types.OptionJAX,
@@ -690,6 +713,7 @@ def _make_data_jax(
       'efc_pos': (nefc, float_),
       'efc_margin': (nefc, float_),
       'efc_frictionloss': (nefc, float_),
+      'efc_softness_scale': (nefc, float_),
       'efc_D': (nefc, float_),
       'efc_aref': (nefc, float_),
       'efc_force': (nefc, float_),
@@ -1068,6 +1092,10 @@ def _put_data_jax(
       # this happens when M is empty or unstable simulation
       impl_fields['qLD'] = np.zeros((m.nv, m.nv))
     impl_fields['qLDiagInv'] = np.zeros(0)
+
+  # MuJoCo has no counterpart (it needs each row's solimp width); the next
+  # make_constraint recomputes it, so a placeholder of ones is enough here.
+  impl_fields['efc_softness_scale'] = np.ones(nefc)
 
   impl_fields['contact'] = contact
   impl_fields.update(

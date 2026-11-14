@@ -80,7 +80,7 @@ def _worker(cfg: Config) -> dict:
   sys.path.insert(0, str(_HERE))
   import scenes  # pylint: disable=g-import-not-at-top
 
-  backend_env = _backend_env(cfg.backend)
+  backend = _check_backend(cfg.backend)
 
   solver_ = {'newton': mujoco.mjtSolver.mjSOL_NEWTON,
              'cg': mujoco.mjtSolver.mjSOL_CG}[cfg.solver]
@@ -91,6 +91,7 @@ def _worker(cfg: Config) -> dict:
                          ls_iterations=cfg.ls_iterations,
                          tolerance=cfg.tolerance)
   mx = mjx.put_model(sc.model)
+  mx = mx.replace(opt=mx.opt.replace(grad_backend=backend))
   dx0 = mjx.put_data(sc.model, sc.data)
 
   # Batch of initial states: small velocity perturbations around the scene.
@@ -158,9 +159,8 @@ def _worker(cfg: Config) -> dict:
     except Exception:  # pylint: disable=broad-except
       return None
 
-  os.environ['MJX_GRAD_BACKEND'] = backend_env
   res = {'config': dataclasses.asdict(cfg), 'device': str(jax.devices()[0]),
-         'mjx_grad_backend': backend_env,
+         'mjx_grad_backend': backend,  # key kept for existing result files
          'nv': int(mx.nv), 'nefc': int(dx0._impl.nefc), 'nu': int(nu),
          'ncon': int(dx0._impl.ncon)}
 
@@ -188,7 +188,6 @@ def _worker(cfg: Config) -> dict:
     f_bw, res['compile_b'] = timed_compile(lambda vjp, ct: vjp(ct), vjp0, one)
     res['mem_b'] = mem(f_bw)
     del vjp0
-  os.environ.pop('MJX_GRAD_BACKEND', None)
 
   block = lambda x: jax.tree_util.tree_map(lambda a: a.block_until_ready(), x)
 
@@ -267,7 +266,7 @@ def _worker(cfg: Config) -> dict:
 BACKENDS = ('while', 'unrolled', 'scan', 'ift')
 
 
-def _backend_env(name: str) -> str:
+def _check_backend(name: str) -> str:
   if name not in BACKENDS:
     raise ValueError(f'unknown backend {name!r}; known: {", ".join(BACKENDS)}')
   return name
@@ -293,7 +292,6 @@ def _gpu_util() -> dict:
 def run_config(cfg: Config, timeout: int = 1800) -> dict:
   env = dict(os.environ)
   env.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
-  env.pop('MJX_GRAD_BACKEND', None)
   before = _gpu_util()
   t0 = time.time()
   try:

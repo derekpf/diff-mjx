@@ -1,12 +1,13 @@
 """Gradient checks for the MJX solver derivative backends.
 
-Backends are selected with ``MJX_GRAD_BACKEND`` at trace time, so every
-function built here is traced inside :func:`backend`.
+The backend is chosen at trace time. These checks build functions that close
+over one model, so each one is traced inside :func:`backend`, which selects
+the backend for every model traced in the block.
 """
 
 import contextlib
-import os
 from typing import Callable
+from unittest import mock
 
 import jax
 from jax import numpy as jp
@@ -23,23 +24,23 @@ FD_EPS = (1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7)
 
 def compile_with(name: str, fn, *args):
   """AOT-compiles ``fn(*args)`` with backend ``name`` (tracing is lazy, so a
-  plain ``jax.jit`` would only read ``MJX_GRAD_BACKEND`` at first call)."""
+  plain ``jax.jit`` would only pick the backend at its first call)."""
   with backend(name):
     return jax.jit(fn).lower(*args).compile()
 
 
 @contextlib.contextmanager
 def backend(name: str):
-  """Selects the solver backend for functions traced inside the block."""
-  old = os.environ.get('MJX_GRAD_BACKEND')
-  os.environ['MJX_GRAD_BACKEND'] = name
-  try:
+  """Selects the solver backend for functions traced inside the block.
+
+  Overrides ``solver.grad_backend`` (a Python attribute, safe while JAX
+  threads run) instead of rebuilding each model with ``opt.grad_backend``,
+  because the functions here already close over their model.
+  """
+  if name not in solver._BACKENDS:  # pylint: disable=protected-access
+    raise ValueError(f'unknown backend {name!r}')
+  with mock.patch.object(solver, 'grad_backend', lambda m: name):
     yield
-  finally:
-    if old is None:
-      os.environ.pop('MJX_GRAD_BACKEND', None)
-    else:
-      os.environ['MJX_GRAD_BACKEND'] = old
 
 
 def param_dim(m: mujoco.MjModel, kind: str) -> int:
