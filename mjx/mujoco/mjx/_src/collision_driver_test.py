@@ -69,6 +69,52 @@ def _collide(
   return d, dx
 
 
+class ContactGeometryGradientTest(parameterized.TestCase):
+  """Contact position and frame are held constant in the backward pass."""
+
+  # A sphere resting in a plane (analytic pair) and a capsule pressed against a
+  # cylinder (SDF pair, whose normal is the SDF gradient at the found point).
+  _MJCF = """
+    <mujoco>
+      <worldbody>
+        <geom size="40 40 40" type="plane"/>
+        <body pos="0 0 0.09">
+          <joint type="free"/>
+          <geom size="0.1" type="sphere"/>
+        </body>
+        <body pos="1 0 0.5">
+          <joint type="free"/>
+          <geom size="0.1 0.2" type="cylinder"/>
+        </body>
+        <body pos="1.18 0 0.6" euler="0 0.4 0.3">
+          <joint type="free"/>
+          <geom size="0.09 0.15" type="capsule"/>
+        </body>
+      </worldbody>
+    </mujoco>
+  """
+
+  def test_only_distance_keeps_gradient(self):
+    m = mujoco.MjModel.from_xml_string(self._MJCF)
+    mx = mjx.put_model(m)
+    dx = mjx.put_data(m, mujoco.MjData(m))
+
+    def contact(qpos):
+      d = mjx.kinematics(mx, dx.replace(qpos=qpos))
+      c = collision_driver.collision(mx, d)._impl.contact
+      return c.dist, c.pos, c.frame
+
+    dist, _, _ = jax.jit(contact)(dx.qpos)
+    jdist, jpos, jframe = jax.jit(jax.jacrev(contact))(dx.qpos)
+    in_contact = np.asarray(dist) < 0
+    self.assertGreaterEqual(int(in_contact.sum()), 2)
+    # The distance of every touching contact depends on the configuration.
+    self.assertTrue(np.all(np.abs(np.asarray(jdist))[in_contact].max(-1) > 0))
+    # The position (moment arm) and frame (force direction) do not.
+    np.testing.assert_array_equal(np.asarray(jpos), 0.0)
+    np.testing.assert_array_equal(np.asarray(jframe), 0.0)
+
+
 class SphereCollisionTest(parameterized.TestCase):
   _SPHERE_PLANE = """
     <mujoco>
