@@ -24,7 +24,19 @@ from mujoco.mjx._src import solver
 from mujoco.mjx._src import support
 import numpy as np
 
-jax.config.update('jax_enable_x64', True)
+_X64_BEFORE = None
+
+
+def setUpModule():
+  # Float64 only for this module's tests. A module-level config update runs
+  # at collection and would switch every test in the same session to x64.
+  global _X64_BEFORE
+  _X64_BEFORE = jax.config.jax_enable_x64
+  jax.config.update('jax_enable_x64', True)
+
+
+def tearDownModule():
+  jax.config.update('jax_enable_x64', _X64_BEFORE)
 
 _MASS = 1.0
 _MU = 0.5
