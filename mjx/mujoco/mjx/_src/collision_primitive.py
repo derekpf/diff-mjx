@@ -46,7 +46,7 @@ def collider(ncon: int):
           func,
           # soft=softjax_mode is not None,
           # softjax_mode=softjax_mode,
-          # st_enable=m.opt.contact_st_enable,
+          # st_enable=m.opt.tdant_st_enable,
           soft=False,
           softjax_mode=None,
           st_enable=False,

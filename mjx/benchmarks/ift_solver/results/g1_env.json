@@ -1,5 +1,5 @@
 {
- "description": "G1JoystickFlatTerrain BPTT, forlax train_g1_shac.py env config (reward_softness=0.05, softjax_mode=smooth, pw_solimp=[0,0.8,1,1,10], contact_st_enable=True), 256 envs, horizon 16, opt.iterations=3, seed 0, float32, RTX 5080 shared with one other job. Times in ms (median of 10), memory = XLA temp bytes of the fused value_and_grad. Produced by g1_env_bench.py; \"remat\" = jax.remat(env.step, prevent_cse=False) as in forlax remat_enable.",
+ "description": "G1JoystickFlatTerrain BPTT, forlax train_g1_shac.py env config (reward_softness=0.05, softjax_mode=smooth, tdant_solimp=[0,0.8,1,1,10], tdant_st_enable=True), 256 envs, horizon 16, opt.iterations=3, seed 0, float32, RTX 5080 shared with one other job. Times in ms (median of 10), memory = XLA temp bytes of the fused value_and_grad. Produced by g1_env_bench.py; \"remat\" = jax.remat(env.step, prevent_cse=False) as in forlax remat_enable.",
  "runs": {
   "default+remat": {
    "t_f": 355.47999548725784,

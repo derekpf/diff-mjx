@@ -254,7 +254,7 @@ def _put_option(
   fields['enableflags'] = types.EnableBit(o.enableflags)
   fields['jacobian'] = types.JacobianType(o.jacobian)
   fields['softjax_mode'] = getattr(o, 'softjax_mode', None)
-  fields['contact_st_enable'] = bool(getattr(o, 'contact_st_enable', False))
+  fields['tdant_st_enable'] = bool(getattr(o, 'tdant_st_enable', False))
   fields['sensor_softness'] = float(getattr(o, 'sensor_softness', 0.0))
   fields['sensor_st_enable'] = bool(getattr(o, 'sensor_st_enable', False))
   for name in (
@@ -276,8 +276,8 @@ def _put_option(
   fields['refinement_fallback_enable'] = bool(
       getattr(o, 'refinement_fallback_enable', True)
   )
-  pw_solimp = getattr(o, 'pw_solimp', None)
-  fields['pw_solimp'] = None if pw_solimp is None else jp.array(pw_solimp)
+  tdant_solimp = getattr(o, 'tdant_solimp', None)
+  fields['tdant_solimp'] = None if tdant_solimp is None else jp.array(tdant_solimp)
   fields['scan_loop'] = bool(getattr(o, 'scan_loop', True))
   # Gradient backend of the constraint solve (see solver.grad_backend).
   fields['grad_backend'] = getattr(o, 'grad_backend', 'ift')

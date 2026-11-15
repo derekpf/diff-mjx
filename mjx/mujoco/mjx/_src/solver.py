@@ -1268,7 +1268,7 @@ def _update_constraint(
     raise NotImplementedError(f'unsupported cone type: {m.opt.cone}')
 
   if stickslip_softness > 0 or liftoff_softness > 0:
-    # Smooth nominal contacts only: pw_solimp contacts (efc_pos >= efc_margin)
+    # Smooth nominal contacts only: tdant_solimp contacts (efc_pos >= efc_margin)
     # and padding rows keep the hard force. Whole contacts are selected by
     # their first (normal) row, so the per-contact force stays a gradient
     # (elliptic friction rows have efc_pos 0).

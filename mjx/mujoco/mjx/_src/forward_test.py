@@ -58,16 +58,16 @@ class ForwardTest(absltest.TestCase):
     d.qvel[2] = -1.0
     mx = mjx.put_model(m)
     dx = mjx.put_data(m, d)
-    pw_solimp = jp.array([0.9, 0.95, 0.002, 0.5, 2.0])
+    tdant_solimp = jp.array([0.9, 0.95, 0.002, 0.5, 2.0])
 
-    def contact_force(pw_solimp, st_enable, qpos):
-      opt = mx.opt.replace(pw_solimp=pw_solimp, contact_st_enable=st_enable)
+    def contact_force(tdant_solimp, st_enable, qpos):
+      opt = mx.opt.replace(tdant_solimp=tdant_solimp, tdant_st_enable=st_enable)
       return mjx.forward(
           mx.replace(opt=opt), dx.replace(qpos=qpos)
       ).qfrc_constraint[2]
 
-    def contact_force_and_grad(pw_solimp, st_enable):
-      fn = lambda qpos: contact_force(pw_solimp, st_enable, qpos)
+    def contact_force_and_grad(tdant_solimp, st_enable):
+      fn = lambda qpos: contact_force(tdant_solimp, st_enable, qpos)
       return fn(dx.qpos), jax.grad(fn)(dx.qpos)[2]
 
     force, grad = contact_force_and_grad(None, False)
@@ -78,11 +78,11 @@ class ForwardTest(absltest.TestCase):
     self.assertEqual(force, 0.0)
     self.assertEqual(grad, 0.0)
 
-    force, grad = contact_force_and_grad(pw_solimp, False)
+    force, grad = contact_force_and_grad(tdant_solimp, False)
     self.assertGreater(force, 0.0)
     self.assertLess(grad, 0.0)
 
-    force, grad = contact_force_and_grad(pw_solimp, True)
+    force, grad = contact_force_and_grad(tdant_solimp, True)
     self.assertEqual(force, 0.0)
     self.assertLess(grad, 0.0)
 

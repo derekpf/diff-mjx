@@ -64,12 +64,12 @@ def _box_contact_scale() -> float:
 _ELLIPTIC_BOX_XML = _BOX_XML.replace('cone="pyramidal"', 'cone="elliptic"')
 
 
-def _model(softness: float, pw_solimp=None, xml: str = _BOX_XML) -> mjx.Model:
+def _model(softness: float, tdant_solimp=None, xml: str = _BOX_XML) -> mjx.Model:
   m = mujoco.MjModel.from_xml_string(xml)
   mx = mjx.put_model(m)
   opt = mx.opt.replace(stickslip_softness=softness, liftoff_softness=softness)
-  if pw_solimp is not None:
-    opt = opt.replace(pw_solimp=jp.array(pw_solimp))
+  if tdant_solimp is not None:
+    opt = opt.replace(tdant_solimp=jp.array(tdant_solimp))
   return mx.replace(opt=opt)
 def _slope(mx: mjx.Model, dx: mjx.Data, dof: int, forces: np.ndarray) -> np.ndarray:
   """d qacc[dof] / d qfrc_applied[dof] over a sweep of applied forces."""
@@ -103,8 +103,8 @@ class ContactSoftnessTest(absltest.TestCase):
   # when sliding (mu**2 / (1 + mu**2) of it), so its jump is smaller.
   _MIN_STICK_SLIP_JUMP = 0.1
 
-  def _model(self, softness, pw_solimp=None):
-    return _model(softness, pw_solimp, xml=self._XML)
+  def _model(self, softness, tdant_solimp=None):
+    return _model(softness, tdant_solimp, xml=self._XML)
 
   def setUp(self):
     super().setUp()
@@ -158,8 +158,8 @@ class ContactSoftnessTest(absltest.TestCase):
     errs = [np.max(np.abs(_slope(self._model(softness), self.dx, 0, forces) - hard)) for softness in (1.0, 0.1, 0.01)]
     self.assertLess(errs[2], errs[0])
     np.testing.assert_allclose(_slope(self._model(1e-3), self.dx, 0, forces), hard, atol=1e-3, rtol=1e-3)
-  def test_pw_solimp_rows_untouched(self):
-    """A separated contact within pw_solimp width is only a pw_solimp row; softness must not change it."""
+  def test_tdant_solimp_rows_untouched(self):
+    """A separated contact within tdant_solimp width is only a tdant_solimp row; softness must not change it."""
     pw = [0.0, 0.4, 1.0, 1.0, 10.0]
     m = mujoco.MjModel.from_xml_string(self._XML)
     d = mujoco.MjData(m)

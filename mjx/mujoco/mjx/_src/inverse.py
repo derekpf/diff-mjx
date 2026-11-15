@@ -115,9 +115,9 @@ def _inverse(m: Model, d: Data, soft: bool) -> Data:
 
 def inverse(m: Model, d: Data) -> Data:
   """Inverse dynamics with the same piecewise ST policy as forward dynamics."""
-  pw_enabled = m.opt.pw_solimp is not None
-  if pw_enabled and m.opt.contact_st_enable:
+  tdant_enabled = m.opt.tdant_solimp is not None
+  if tdant_enabled and m.opt.tdant_st_enable:
     d_soft = _inverse(m, d, soft=True)
     d_hard = _inverse(m, d, soft=False)
     return math.straight_through(d_hard, d_soft)
-  return _inverse(m, d, soft=pw_enabled)
+  return _inverse(m, d, soft=tdant_enabled)

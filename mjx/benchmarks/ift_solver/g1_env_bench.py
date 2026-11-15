@@ -2,7 +2,7 @@
 
 Mirrors forlax's scripts/train_g1_shac.py environment settings:
 G1JoystickFlatTerrain, reward_softness=0.05, DiffEnvWrapper options
-(softjax_mode='smooth', pw_solimp=[0, .8, 1, 1, 10], contact_st_enable=True),
+(softjax_mode='smooth', tdant_solimp=[0, .8, 1, 1, 10], tdant_st_enable=True),
 num_envs=256, horizon_len=16. The gradient is taken w.r.t. an open-loop
 action sequence (B, H, nu) of the summed reward, so per-env gradients are
 separable and non-finite values can be attributed to environments.
@@ -55,8 +55,8 @@ def _worker(cfg: Config) -> dict:
   env.reward_st_enable = False
   mx = env.mjx_model
   opt = mx.opt.replace(
-      softjax_mode='smooth', pw_solimp=jp.array([0.0, 0.8, 1.0, 1.0, 10.0]),
-      contact_st_enable=True, sensor_softness=0.0, sensor_st_enable=False,
+      softjax_mode='smooth', tdant_solimp=jp.array([0.0, 0.8, 1.0, 1.0, 10.0]),
+      tdant_st_enable=True, sensor_softness=0.0, sensor_st_enable=False,
       grad_backend=backend)
   if cfg.iterations:
     opt = opt.replace(iterations=cfg.iterations)

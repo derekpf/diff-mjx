@@ -247,7 +247,7 @@ class SoftCollisionTest(parameterized.TestCase):
 
     def contact(mode, st_enable):
       model = mx.replace(opt=mx.opt.replace(
-          softjax_mode=mode, contact_st_enable=st_enable, pw_solimp=None
+          softjax_mode=mode, tdant_st_enable=st_enable, tdant_solimp=None
       ))
       result = jax.jit(collision_driver.collision)(model, dx)._impl.contact
       return result.dist, result.pos, result.frame
@@ -266,7 +266,7 @@ class SoftCollisionTest(parameterized.TestCase):
                                  err_msg=name)
 
     model = mx.replace(opt=mx.opt.replace(
-        softjax_mode=mode, contact_st_enable=True, pw_solimp=None
+        softjax_mode=mode, tdant_st_enable=True, tdant_solimp=None
     ))
     def contact_vector(qpos):
       data = smooth.kinematics(model, dx.replace(qpos=qpos))
@@ -686,7 +686,7 @@ class PlaneConvexGradientTest(parameterized.TestCase):
     m = mujoco.MjModel.from_xml_string(_PLANE_FOOT_XML)
     mx = mjx.put_model(m)
     mx = mx.replace(opt=mx.opt.replace(
-        softjax_mode=mode, contact_st_enable=st_enable, pw_solimp=None
+        softjax_mode=mode, tdant_st_enable=st_enable, tdant_solimp=None
     ))
     dx = mjx.put_data(m, mujoco.MjData(m))
     rot0 = np.asarray(rot0, dtype=float)
