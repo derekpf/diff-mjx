@@ -477,11 +477,16 @@ def _efc_limit_tendon(m: Model, d: Data, soft: bool) -> Optional[_Efc]:
 def _contact_piecewise(
     m: Model, pos_aref: jax.Array, solimp: jax.Array, soft: bool
 ) -> Tuple[jax.Array, jax.Array]:
-  """Applies touchdown-anticipation impedance outside the contact margin."""
-  if soft and m.opt.tdant_solimp is not None:
-    tdant_solimp = jp.array(m.opt.tdant_solimp)
-    pos_imp = jp.where(pos_aref < 0, pos_aref, pos_aref - tdant_solimp[2])
-    solimp = jp.where(pos_aref < 0, solimp, tdant_solimp)
+  """Applies the precontact impedance outside the contact margin.
+
+  Precontact rows are full contact rows (normal and friction directions) with
+  their own solimp profile, measured from the outer edge of its width.
+  """
+  if soft and m.opt.precontact_solimp is not None:
+    precontact_solimp = jp.array(m.opt.precontact_solimp)
+    precontact = pos_aref >= 0
+    pos_imp = jp.where(precontact, pos_aref - precontact_solimp[2], pos_aref)
+    solimp = jp.where(precontact, precontact_solimp, solimp)
     return pos_imp, solimp
 
   return pos_aref, solimp

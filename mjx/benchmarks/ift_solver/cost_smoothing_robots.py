@@ -58,7 +58,7 @@ TIMING_B, TIMING_H, TIMING_REPS = 32, 16, 15
 
 def _setup(name):
   env = registry.load(name)
-  DiffEnvWrapper(env, softjax_mode=None, tdant_solimp=None)
+  DiffEnvWrapper(env, softjax_mode=None, precontact_solimp=None)
   hard = env.mjx_model
   return env, hard, hard.replace(opt=hard.opt.replace(**SMOOTH))
 

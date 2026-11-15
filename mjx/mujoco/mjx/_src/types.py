@@ -510,7 +510,6 @@ class Option(PyTreeNode):
   solver: SolverType
   timestep: jax.Array
   softjax_mode: Optional[str]
-  tdant_st_enable: bool
   sensor_softness: float
   sensor_st_enable: bool
   stickslip_softness: float
@@ -521,7 +520,7 @@ class Option(PyTreeNode):
   refinement_ls_iterations: int
   refinement_tolerance: float
   refinement_fallback_enable: bool
-  tdant_solimp: Optional[jax.Array]
+  precontact_solimp: Optional[jax.Array]
   scan_loop: bool
   grad_backend: str
   _impl: Union[OptionJAX, mjxw_types.OptionWarp]

@@ -439,6 +439,8 @@ def _forward(m: Model, d: Data, soft: bool) -> Data:
   if not isinstance(m._impl, ModelJAX) or not isinstance(d._impl, DataJAX):
     raise ValueError('forward requires JAX backend implementation.')
 
+  if not soft:
+    m = nominal_model(m)
   d = fwd_position(m, d, soft=soft)
   d = sensor.sensor_pos(m, d)
   d = fwd_velocity(m, d)
@@ -456,17 +458,53 @@ def _forward(m: Model, d: Data, soft: bool) -> Data:
   return d
 
 
+def nominal_model(m: Model) -> Model:
+  """The model without precontact_solimp, for the nominal branch's solve."""
+  if m.opt.precontact_solimp is None:
+    return m
+  return m.replace(opt=m.opt.replace(precontact_solimp=None))
+
+
+def _precontact_forward(m: Model, d: Data) -> Data:
+  """Nominal forward dynamics that differentiate the precontact rows.
+
+  The precontact layer only adds impedance to contact rows outside the
+  margin, so everything before the constraint rows, and the velocity,
+  actuation and smooth-acceleration stages that do not read them, are shared.
+  Only the rows, the solve and the acceleration sensors run twice.
+  """
+  d = fwd_position(m, d)
+  d = sensor.sensor_pos(m, d)
+  d = fwd_velocity(m, d)
+  d = sensor.sensor_vel(m, d)
+  d = fwd_actuation(m, d)
+  d = fwd_acceleration(m, d)
+
+  if d._impl.efc_J.size == 0:
+    return d.replace(qacc=d.qacc_smooth)
+
+  d_soft = constraint.make_constraint(m, d, soft=True)
+  m_hard = nominal_model(m)
+  d_hard = sensor.sensor_acc(m_hard, named_scope(solver.solve)(m_hard, d))
+  d_soft = sensor.sensor_acc(m, named_scope(solver.solve)(m, d_soft))
+  return math.straight_through(d_hard, d_soft)
+
+
 @named_scope
 def forward(m: Model, d: Data) -> Data:
-  tdant_enabled = m.opt.tdant_solimp is not None
-  if tdant_enabled and m.opt.tdant_st_enable:
-    d_soft = _forward(m, d, soft=True)
-    d_hard = _forward(m, d, soft=False)
+  """Forward dynamics.
 
-    d = math.straight_through(d_hard, d_soft)
-  else:
-    d = _forward(m, d, soft=tdant_enabled)
-  return d
+  With precontact_solimp set, the precontact rows (separated contacts within
+  its width, with normal and friction directions and the constraint cost
+  smoothing of in-contact contacts) are straight-through: the forward pass is
+  nominal and only the gradients see them.
+  """
+  if (
+      m.opt.precontact_solimp is None
+      or (m.impl == Impl.WARP and d.impl == Impl.WARP and mjxw.WARP_INSTALLED)
+  ):
+    return _forward(m, d, soft=False)
+  return _precontact_forward(m, d)
 
 
 @named_scope

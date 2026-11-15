@@ -267,7 +267,8 @@ def straight_through(x_hard, x_soft):
   """Keeps nominal values and differentiates the surrogate, including pytrees."""
 
   def replace_gradient(hard, soft):
-    if not jp.issubdtype(hard.dtype, jp.inexact):
+    # Leaves shared by both passes already carry the surrogate gradient.
+    if hard is soft or not jp.issubdtype(hard.dtype, jp.inexact):
       return hard
     return jax.lax.stop_gradient(hard) + (soft - jax.lax.stop_gradient(soft))
 

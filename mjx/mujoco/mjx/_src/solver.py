@@ -1120,17 +1120,28 @@ def _elliptic_group_force_jvp(slip_softness, liftoff_softness, primals, tangents
   return force, d_force
 
 
-def _nominal_contact_rows(m: Model, d: Data) -> jax.Array:
-  """Rows of in-contact (``efc_pos < efc_margin``) contacts, decided per
-  contact by its first row and broadcast to all of its rows."""
+def _smoothed_contact_rows(m: Model, d: Data) -> jax.Array:
+  """Rows of the contacts whose force the cost smoothing replaces.
+
+  These are in-contact (``efc_pos < efc_margin``) contacts and, with
+  ``opt.precontact_solimp`` set, the active precontact contacts (separated by
+  less than the precontact width), so their stick/slip and liftoff (their
+  approach gate) get the same smoothing as in-contact contacts. Rows beyond
+  that width are inactive padding and keep their zero force. The nominal branch
+  of the precontact straight-through solves without ``precontact_solimp`` (see
+  forward.forward), so it smooths only in-contact rows. Contacts are decided by
+  their first row and broadcast to all of their rows.
+  """
   owner = np.arange(d._impl.efc_type.shape[0])
   for start, ncon, rows in _contact_edge_groups(m):
     owner[start : start + ncon * rows] = start + rows * (
         np.arange(ncon * rows) // rows
     )
-  row = (d._impl.efc_type >= ConstraintType.CONTACT_FRICTIONLESS) & (
-      d._impl.efc_pos < d._impl.efc_margin
-  )
+  separation = d._impl.efc_pos - d._impl.efc_margin
+  smoothed = separation < 0
+  if m.opt.precontact_solimp is not None:
+    smoothed = separation < jp.asarray(m.opt.precontact_solimp)[2]
+  row = (d._impl.efc_type >= ConstraintType.CONTACT_FRICTIONLESS) & smoothed
   return row[owner]
 
 
@@ -1268,15 +1279,15 @@ def _update_constraint(
     raise NotImplementedError(f'unsupported cone type: {m.opt.cone}')
 
   if stickslip_softness > 0 or liftoff_softness > 0:
-    # Smooth nominal contacts only: tdant_solimp contacts (efc_pos >= efc_margin)
-    # and padding rows keep the hard force. Whole contacts are selected by
-    # their first (normal) row, so the per-contact force stays a gradient
-    # (elliptic friction rows have efc_pos 0).
-    nominal = _nominal_contact_rows(m, d)
+    # Smooth in-contact contacts and, with opt.precontact_solimp, active
+    # precontact contacts; padding rows keep the hard force. Whole contacts
+    # are selected by their first (normal) row, so the per-contact force stays
+    # a gradient (elliptic friction rows have efc_pos 0).
+    smoothed = _smoothed_contact_rows(m, d)
     smooth_force = _contact_cost_force(
         m, d, ctx.Jaref, scale, stickslip_softness, liftoff_softness
     )
-    efc_force = jp.where(nominal, smooth_force, efc_force)
+    efc_force = jp.where(smoothed, smooth_force, efc_force)
 
   if limit_softness > 0:
     # Engaged limit rows only; disengaged rows keep their zero force.

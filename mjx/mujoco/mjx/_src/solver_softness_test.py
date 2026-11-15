@@ -76,12 +76,12 @@ def _box_contact_scale() -> float:
 _ELLIPTIC_BOX_XML = _BOX_XML.replace('cone="pyramidal"', 'cone="elliptic"')
 
 
-def _model(softness: float, tdant_solimp=None, xml: str = _BOX_XML) -> mjx.Model:
+def _model(softness: float, precontact_solimp=None, xml: str = _BOX_XML) -> mjx.Model:
   m = mujoco.MjModel.from_xml_string(xml)
   mx = mjx.put_model(m)
   opt = mx.opt.replace(stickslip_softness=softness, liftoff_softness=softness)
-  if tdant_solimp is not None:
-    opt = opt.replace(tdant_solimp=jp.array(tdant_solimp))
+  if precontact_solimp is not None:
+    opt = opt.replace(precontact_solimp=jp.array(precontact_solimp))
   return mx.replace(opt=opt)
 def _slope(mx: mjx.Model, dx: mjx.Data, dof: int, forces: np.ndarray) -> np.ndarray:
   """d qacc[dof] / d qfrc_applied[dof] over a sweep of applied forces."""
@@ -115,8 +115,8 @@ class ContactSoftnessTest(absltest.TestCase):
   # when sliding (mu**2 / (1 + mu**2) of it), so its jump is smaller.
   _MIN_STICK_SLIP_JUMP = 0.1
 
-  def _model(self, softness, tdant_solimp=None):
-    return _model(softness, tdant_solimp, xml=self._XML)
+  def _model(self, softness, precontact_solimp=None):
+    return _model(softness, precontact_solimp, xml=self._XML)
 
   def setUp(self):
     super().setUp()
@@ -170,8 +170,8 @@ class ContactSoftnessTest(absltest.TestCase):
     errs = [np.max(np.abs(_slope(self._model(softness), self.dx, 0, forces) - hard)) for softness in (1.0, 0.1, 0.01)]
     self.assertLess(errs[2], errs[0])
     np.testing.assert_allclose(_slope(self._model(1e-3), self.dx, 0, forces), hard, atol=1e-3, rtol=1e-3)
-  def test_tdant_solimp_rows_untouched(self):
-    """A separated contact within tdant_solimp width is only a tdant_solimp row; softness must not change it."""
+  def test_precontact_rows_get_contact_smoothing(self):
+    """A separated contact within the precontact width is smoothed like an in-contact one."""
     pw = [0.0, 0.4, 1.0, 1.0, 10.0]
     m = mujoco.MjModel.from_xml_string(self._XML)
     d = mujoco.MjData(m)
@@ -180,13 +180,22 @@ class ContactSoftnessTest(absltest.TestCase):
     dx = mjx.put_data(m, d)
     self.assertTrue((np.asarray(dx._impl.contact.dist) > 0).all())
 
-    def loss(mx, qpos):
-      return jp.sum(mjx.forward(mx, dx.replace(qpos=qpos)).qacc ** 2)
+    def qacc(mx, qpos):
+      return mjx.forward(mx, dx.replace(qpos=qpos)).qacc
 
+    loss = lambda mx, q: jp.sum(qacc(mx, q) ** 2)
+    np.testing.assert_array_equal(
+        qacc(self._model(0.0, pw), dx.qpos), qacc(self._model(1.0, pw), dx.qpos)
+    )
     g0 = jax.grad(lambda q: loss(self._model(0.0, pw), q))(dx.qpos)
     g1 = jax.grad(lambda q: loss(self._model(1.0, pw), q))(dx.qpos)
     self.assertTrue(np.isfinite(g1).all())
-    np.testing.assert_array_equal(g0, g1)
+    self.assertFalse(np.allclose(g0, g1))
+    # Without precontact_solimp the separated contact has no row to smooth.
+    np.testing.assert_array_equal(
+        jax.grad(lambda q: loss(self._model(0.0), q))(dx.qpos),
+        jax.grad(lambda q: loss(self._model(1.0), q))(dx.qpos),
+    )
 
   def test_non_ift_backend_raises(self):
     unrolled = lambda mx: mx.replace(opt=mx.opt.replace(grad_backend='unrolled'))
@@ -980,7 +989,7 @@ class EllipticContactCostTest(absltest.TestCase):
     self.assertEqual([g[2] for g in groups], [1, 3, 4, 6])
     efc_type, pos = np.asarray(dx._impl.efc_type), np.asarray(dx._impl.efc_pos)
     margin = np.asarray(dx._impl.efc_margin)
-    nominal = np.asarray(solver._nominal_contact_rows(mx, dx))
+    nominal = np.asarray(solver._smoothed_contact_rows(mx, dx))
     for start, ncon, rows in groups:
       want = (mujoco.mjtConstraint.mjCNSTR_CONTACT_FRICTIONLESS if rows == 1
               else mujoco.mjtConstraint.mjCNSTR_CONTACT_ELLIPTIC)

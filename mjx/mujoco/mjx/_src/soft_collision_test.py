@@ -245,28 +245,24 @@ class SoftCollisionTest(parameterized.TestCase):
     mujoco.mj_forward(m, d)
     mx, dx = mjx.put_model(m), mjx.put_data(m, d)
 
-    def contact(mode, st_enable):
+    def contact(mode):
       model = mx.replace(opt=mx.opt.replace(
-          softjax_mode=mode, tdant_st_enable=st_enable, tdant_solimp=None
+          softjax_mode=mode, precontact_solimp=None
       ))
       result = jax.jit(collision_driver.collision)(model, dx)._impl.contact
       return result.dist, result.pos, result.frame
 
-    hard = contact('hard', False)
-    straight_through = contact(mode, True)
-    for actual, expected in zip(straight_through, hard):
-      np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5,
-                                 err_msg=name)
+    hard = contact('hard')
     # Collision detection is always hard (see collision_primitive.collider and
-    # collision_convex.collider), so requesting a soft mode without contact ST
-    # also gives the hard contacts.
-    soft = contact(mode, False)
+    # collision_convex.collider), so requesting a soft mode gives the hard
+    # contacts.
+    soft = contact(mode)
     for actual, expected in zip(soft, hard):
       np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5,
                                  err_msg=name)
 
     model = mx.replace(opt=mx.opt.replace(
-        softjax_mode=mode, tdant_st_enable=True, tdant_solimp=None
+        softjax_mode=mode, precontact_solimp=None
     ))
     def contact_vector(qpos):
       data = smooth.kinematics(model, dx.replace(qpos=qpos))
@@ -682,12 +678,10 @@ _PLANE_FOOT_POSES = (
 class PlaneConvexGradientTest(parameterized.TestCase):
   """plane_convex selection is hard, so distances keep geometric gradients."""
 
-  def _dist_fn(self, mode, st_enable, pos0, rot0):
+  def _dist_fn(self, mode, pos0, rot0):
     m = mujoco.MjModel.from_xml_string(_PLANE_FOOT_XML)
     mx = mjx.put_model(m)
-    mx = mx.replace(opt=mx.opt.replace(
-        softjax_mode=mode, tdant_st_enable=st_enable, tdant_solimp=None
-    ))
+    mx = mx.replace(opt=mx.opt.replace(softjax_mode=mode, precontact_solimp=None))
     dx = mjx.put_data(m, mujoco.MjData(m))
     rot0 = np.asarray(rot0, dtype=float)
     angle = np.linalg.norm(rot0)
@@ -709,15 +703,12 @@ class PlaneConvexGradientTest(parameterized.TestCase):
   @parameterized.product(
       pose=_PLANE_FOOT_POSES,
       mode=('smooth', 'c2'),
-      st_enable=(False, True),
   )
-  def test_forward_matches_hard_and_gradients_are_geometric(
-      self, pose, mode, st_enable
-  ):
+  def test_forward_matches_hard_and_gradients_are_geometric(self, pose, mode):
     name, pos0, rot0, away_from_switch = pose
     x0 = jp.zeros(6)
-    hard_fn = self._dist_fn('hard', False, pos0, rot0)
-    dist_fn = self._dist_fn(mode, st_enable, pos0, rot0)
+    hard_fn = self._dist_fn('hard', pos0, rot0)
+    dist_fn = self._dist_fn(mode, pos0, rot0)
 
     hard = np.asarray(jax.jit(hard_fn)(x0))
     dist = np.asarray(jax.jit(dist_fn)(x0))

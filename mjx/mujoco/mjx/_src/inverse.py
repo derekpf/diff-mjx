@@ -15,6 +15,7 @@
 """Inverse dynamics functions."""
 
 from jax import numpy as jp
+from mujoco.mjx._src import constraint
 from mujoco.mjx._src import derivative
 from mujoco.mjx._src import forward
 from mujoco.mjx._src import math
@@ -83,18 +84,8 @@ def inv_constraint(m: Model, d: Data) -> Data:
   })
 
 
-def _inverse(m: Model, d: Data, soft: bool) -> Data:
-  """Inverse dynamics."""
-
-  d = forward.fwd_position(m, d, soft=soft)
-  d = sensor.sensor_pos(m, d)
-  d = forward.fwd_velocity(m, d)
-  d = sensor.sensor_vel(m, d)
-
-  qacc = d.qacc
-  if m.opt.enableflags & EnableBit.INVDISCRETE:
-    d = discrete_acc(m, d)
-
+def _inverse_constraint(m: Model, d: Data, qacc) -> Data:
+  """Constraint-dependent inverse dynamics after the shared position/velocity pass."""
   d = inv_constraint(m, d)
   d = smooth.rne(m, d)
   d = smooth.tendon_bias(m, d)
@@ -113,11 +104,40 @@ def _inverse(m: Model, d: Data, soft: bool) -> Data:
     return d.replace(qfrc_inverse=qfrc_inverse)
 
 
+def _inverse_position_velocity(m: Model, d: Data):
+  """Position and velocity stages, shared by the nominal and precontact passes."""
+  d = forward.fwd_position(m, d)
+  d = sensor.sensor_pos(m, d)
+  d = forward.fwd_velocity(m, d)
+  d = sensor.sensor_vel(m, d)
+
+  qacc = d.qacc
+  if m.opt.enableflags & EnableBit.INVDISCRETE:
+    d = discrete_acc(m, d)
+  return d, qacc
+
+
+def _inverse(m: Model, d: Data, soft: bool) -> Data:
+  """Inverse dynamics with nominal (soft=False) or precontact contact rows."""
+  d, qacc = _inverse_position_velocity(m, d)
+  if not soft:
+    return _inverse_constraint(forward.nominal_model(m), d, qacc)
+  d = constraint.make_constraint(m, d, soft=True)
+  return _inverse_constraint(m, d, qacc)
+
+
 def inverse(m: Model, d: Data) -> Data:
-  """Inverse dynamics with the same piecewise ST policy as forward dynamics."""
-  tdant_enabled = m.opt.tdant_solimp is not None
-  if tdant_enabled and m.opt.tdant_st_enable:
-    d_soft = _inverse(m, d, soft=True)
-    d_hard = _inverse(m, d, soft=False)
-    return math.straight_through(d_hard, d_soft)
-  return _inverse(m, d, soft=tdant_enabled)
+  """Inverse dynamics with the same precontact policy as forward dynamics.
+
+  With precontact_solimp set, the values are nominal and only the gradients see
+  the precontact rows (see forward.forward). The rows only change the
+  constraint-dependent stages, so the position and velocity stages are shared.
+  """
+  d, qacc = _inverse_position_velocity(m, d)
+  d_hard = _inverse_constraint(forward.nominal_model(m), d, qacc)
+  if m.opt.precontact_solimp is None:
+    return d_hard
+  d_soft = _inverse_constraint(
+      m, constraint.make_constraint(m, d, soft=True), qacc
+  )
+  return math.straight_through(d_hard, d_soft)
